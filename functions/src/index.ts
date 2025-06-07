@@ -3,10 +3,16 @@ import * as admin from 'firebase-admin';
 import { 
   Connection, 
   Keypair, 
-  PublicKey, 
   LAMPORTS_PER_SOL,
-  Transaction
+  Transaction,
+  PublicKey
 } from '@solana/web3.js';
+import {
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+  TOKEN_PROGRAM_ID
+} from '@solana/spl-token';
 import axios from 'axios';
 import bs58 from 'bs58';
 
@@ -14,12 +20,12 @@ admin.initializeApp();
 const db = admin.firestore();
 
 // Solana configuration
-const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
 const connection = new Connection(SOLANA_RPC, 'confirmed');
 
-// DEV wallet configuration (YOUR treasury wallet)
-const DEV_WALLET_PRIVATE_KEY = process.env.DEV_WALLET_PRIVATE_KEY; // Your main wallet
-const STAY_TOKEN_MINT = process.env.STAY_TOKEN_MINT || 'YOUR_TOKEN_MINT_ADDRESS';
+// DEV wallet configuration (TEST treasury wallet for devnet)
+const DEV_WALLET_PRIVATE_KEY = process.env.DEV_WALLET_PRIVATE_KEY || '5GwBJRCsJngiDp3JuPzFNtaCfHLwMQ6Thf2xPdiBjZwZNNLRkYQLMquoVevmocVmctBm14K7mP4TXggz9vnMS2cp'; // Test wallet private key
+const STAY_TOKEN_MINT = process.env.STAY_TOKEN_MINT || 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'; // DUMMY token from Credix faucet
 
 // Initialize DEV wallet
 function getDevWallet(): Keypair {
@@ -29,7 +35,7 @@ function getDevWallet(): Keypair {
   return Keypair.fromSecretKey(bs58.decode(DEV_WALLET_PRIVATE_KEY));
 }
 
-// 💰 MONITOR DEV WALLET FOR INCOMING PAYMENTS
+// 💰 MONITOR DEV WALLET FOR INCOMING PAYMENTS  
 export const monitorDevWallet = functions.pubsub.schedule('every 1 minutes').onRun(async (context) => {
   console.log('🔍 Monitoring DEV wallet for game payments...');
   
@@ -41,6 +47,8 @@ export const monitorDevWallet = functions.pubsub.schedule('every 1 minutes').onR
     const currentBalance = await connection.getBalance(devPublicKey);
     const currentSol = currentBalance / LAMPORTS_PER_SOL;
     
+    console.log(`📊 DEV wallet balance: ${currentSol} SOL`);
+    
     // Get last recorded balance from Firestore
     const balanceDoc = await db.collection('treasury').doc('balance').get();
     const lastBalance = balanceDoc.exists ? balanceDoc.data()?.solBalance || 0 : 0;
@@ -49,9 +57,6 @@ export const monitorDevWallet = functions.pubsub.schedule('every 1 minutes').onR
     if (currentSol > lastBalance) {
       const newSol = currentSol - lastBalance;
       console.log(`💰 New game payments detected: ${newSol} SOL`);
-      
-      // Automatically buy STAY tokens with the new SOL
-      await buyStayTokensWithPayments(newSol);
       
       // Update recorded balance
       await db.collection('treasury').doc('balance').set({
@@ -161,6 +166,25 @@ export const recordGamePayment = functions.https.onCall(async (data, context) =>
   }
 });
 
+// 🧪 SIMPLE TEST FUNCTION
+export const testFunction = functions.https.onCall(async (data, context) => {
+  try {
+    return {
+      success: true,
+      message: 'Test function working!',
+      timestamp: new Date().toISOString(),
+      config: {
+        solana_rpc: SOLANA_RPC,
+        stay_token_mint: STAY_TOKEN_MINT,
+        has_private_key: !!DEV_WALLET_PRIVATE_KEY
+      }
+    };
+  } catch (error) {
+    console.error('Error in test function:', error);
+    throw new functions.https.HttpsError('internal', 'Test function failed');
+  }
+});
+
 // 📊 GET TREASURY STATUS
 export const getTreasuryStatus = functions.https.onCall(async (data, context) => {
   try {
@@ -202,21 +226,113 @@ export const getTreasuryStatus = functions.https.onCall(async (data, context) =>
 // 🎯 DISTRIBUTE TOKENS TO PLAYERS (After game ends)
 export const distributeTokensToWinners = functions.https.onCall(async (data, context) => {
   try {
-    const { gameId, winners, tokenAmountPerWinner } = data;
+    const { gameId, winners, tokenAmountPerWinner, tokenMint } = data;
     
-    // This would integrate with your game logic
-    // For now, just record the distribution
+    console.log(`🏆 Starting token distribution for game ${gameId}`);
+    console.log(`Winners: ${winners.length}, Amount each: ${tokenAmountPerWinner}, Token: ${tokenMint}`);
+    
+    const devWallet = getDevWallet();
+    const tokenMintPubkey = new PublicKey(tokenMint || STAY_TOKEN_MINT);
+    
+    // Get dev wallet's token account
+    const devTokenAccount = await getAssociatedTokenAddress(
+      tokenMintPubkey,
+      devWallet.publicKey
+    );
+    
+    const results = [];
+    
+    // Send tokens to each winner
+    for (const winnerAddress of winners) {
+      try {
+        console.log(`💰 Sending ${tokenAmountPerWinner} DUMMY tokens to ${winnerAddress}`);
+        
+        const winnerPubkey = new PublicKey(winnerAddress);
+        
+        // Get or create winner's token account
+        const winnerTokenAccount = await getAssociatedTokenAddress(
+          tokenMintPubkey,
+          winnerPubkey
+        );
+        
+        // Check if winner's token account exists
+        const accountInfo = await connection.getAccountInfo(winnerTokenAccount);
+        
+        const transaction = new Transaction();
+        
+        // Create token account if it doesn't exist
+        if (!accountInfo) {
+          console.log(`📝 Creating token account for winner: ${winnerAddress}`);
+          const createAccountInstruction = createAssociatedTokenAccountInstruction(
+            devWallet.publicKey, // payer
+            winnerTokenAccount,   // account to create
+            winnerPubkey,         // owner
+            tokenMintPubkey       // mint
+          );
+          transaction.add(createAccountInstruction);
+        }
+        
+        // Add transfer instruction
+        const transferInstruction = createTransferInstruction(
+          devTokenAccount,      // source
+          winnerTokenAccount,   // destination  
+          devWallet.publicKey,  // owner
+          tokenAmountPerWinner * Math.pow(10, 6), // amount (DUMMY tokens have 6 decimals)
+          [],                   // signers
+          TOKEN_PROGRAM_ID
+        );
+        transaction.add(transferInstruction);
+        
+        // Get recent blockhash and send transaction
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = devWallet.publicKey;
+        
+        // Sign and send
+        transaction.sign(devWallet);
+        const signature = await connection.sendRawTransaction(transaction.serialize());
+        
+        console.log(`✅ Tokens sent to ${winnerAddress}! Signature: ${signature}`);
+        
+        // Wait for confirmation
+        await connection.confirmTransaction(signature, 'confirmed');
+        
+        results.push({
+          winner: winnerAddress,
+          signature,
+          amount: tokenAmountPerWinner,
+          status: 'success'
+        });
+        
+      } catch (error) {
+        console.error(`❌ Failed to send tokens to ${winnerAddress}:`, error);
+        results.push({
+          winner: winnerAddress,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          status: 'failed'
+        });
+      }
+    }
+    
+    // Record the distribution in Firestore
     await db.collection('tokenDistributions').add({
       gameId,
       winners,
       tokenAmountPerWinner,
+      tokenMint,
       totalDistributed: winners.length * tokenAmountPerWinner,
+      results,
       timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
     
-    console.log(`🏆 Tokens distributed to ${winners.length} winners`);
+    const successCount = results.filter(r => r.status === 'success').length;
+    console.log(`🎉 Token distribution complete: ${successCount}/${winners.length} successful`);
     
-    return { success: true, message: 'Tokens distributed successfully' };
+    return { 
+      success: true, 
+      message: `Tokens distributed to ${successCount}/${winners.length} winners`,
+      results 
+    };
     
   } catch (error) {
     console.error('Error distributing tokens:', error);

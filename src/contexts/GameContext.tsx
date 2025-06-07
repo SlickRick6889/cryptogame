@@ -45,9 +45,9 @@ const initialState: GameState = {
   currentRound: 0,
   maxRounds: 10,
   prizePool: 0,
-  entryFee: 0.1, // SOL
+  entryFee: 0.05, // SOL
   roundTimer: 30,
-  isDemo: true, // Always demo mode for now
+  isDemo: process.env.NEXT_PUBLIC_DEMO_MODE !== 'false', // Read from environment
 };
 
 // Game reducer

@@ -2,9 +2,14 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useGame } from '@/contexts/GameContext';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { WalletMultiButton, WalletDisconnectButton } from '@solana/wallet-adapter-react-ui';
+import { paymentService } from '@/lib/payment';
 
 export default function Home() {
   const { state, joinGame, startGame, resetGame, eliminatePlayer } = useGame();
+  const wallet = useWallet();
+  const { connected, publicKey } = wallet;
   
   console.log('Game state:', state);
   const [demoStarted, setDemoStarted] = useState(false);
@@ -14,6 +19,7 @@ export default function Home() {
   const [playerAlive, setPlayerAlive] = useState(true);
   const [gameTime, setGameTime] = useState(0);
   const [lastCycle, setLastCycle] = useState(0);
+  const [tokensDistributed, setTokensDistributed] = useState(false);
   
   // Refs to store timer IDs so we can clear them
   const countdownRef = useRef<NodeJS.Timeout | null>(null);
@@ -31,17 +37,57 @@ export default function Home() {
     { id: '4', name: 'TokenHunter🎯', wallet: 'demo4', status: 'alive' as const, isNPC: true },
   ];
 
-  const startDemo = () => {
-    console.log('Starting demo...');
+  const startDemo = async () => {
+    console.log('Starting game...');
     
-    // Add demo player
-    joinGame({
-      id: 'player',
-      wallet: 'demo-player',
-      name: 'You (Demo)',
-      status: 'alive',
-      isNPC: false,
-    });
+    if (state.isDemo) {
+      // Demo mode - add demo player
+      joinGame({
+        id: 'player',
+        wallet: 'demo-player',
+        name: 'You (Demo)',
+        status: 'alive',
+        isNPC: false,
+      });
+    } else if (connected && publicKey) {
+      try {
+        // Check wallet balance first
+        const balanceCheck = await paymentService.checkWalletBalance(publicKey);
+        
+        if (!balanceCheck.hasEnough) {
+          alert(`Insufficient SOL! You have ${balanceCheck.balance.toFixed(3)} SOL, but need at least 0.06 SOL (0.05 entry fee + 0.01 transaction fee)`);
+          return;
+        }
+
+        // Charge entry fee
+        const gameId = `game-${Date.now()}`;
+        const signature = await paymentService.chargeEntryFee(wallet, gameId);
+
+        if (signature) {
+          // Record payment in Firebase
+          await paymentService.recordGamePayment(publicKey.toString(), gameId, signature);
+          
+          // Add real player after successful payment
+          joinGame({
+            id: publicKey.toString(),
+            wallet: publicKey.toString(),
+            name: `Player ${publicKey.toString().slice(0, 4)}...${publicKey.toString().slice(-4)}`,
+            status: 'alive',
+            isNPC: false,
+          });
+          
+          console.log('✅ Entry fee paid, player added to game!');
+        }
+        
+      } catch (error) {
+        console.error('❌ Error joining game:', error);
+        alert('Failed to join game. Please try again.');
+        return;
+      }
+    } else {
+      alert('Please connect your wallet first!');
+      return;
+    }
 
     // Add NPCs
     demoNPCs.forEach((npc, index) => {
@@ -52,7 +98,7 @@ export default function Home() {
     });
 
     setDemoStarted(true);
-    console.log('Demo started, demoStarted set to true');
+    console.log('Game started successfully');
   };
 
   const handleStartGame = () => {
@@ -198,6 +244,28 @@ export default function Home() {
     });
   }, [state.phase, state.players, eliminatePlayer]);
 
+  // Distribute tokens when game ends and winner is determined
+  useEffect(() => {
+    if (state.phase === 'results' && state.winner && !tokensDistributed && !state.isDemo) {
+      const distributeTokens = async () => {
+        try {
+          console.log('🏆 Distributing tokens to winner:', state.winner?.wallet);
+          const gameId = `game-${Date.now()}`;
+          const success = await paymentService.distributeTokensToWinner(state.winner!.wallet, gameId);
+          
+          if (success) {
+            setTokensDistributed(true);
+            console.log('✅ Tokens distributed successfully!');
+          }
+        } catch (error) {
+          console.error('❌ Error distributing tokens:', error);
+        }
+      };
+      
+      distributeTokens();
+    }
+  }, [state.phase, state.winner, tokensDistributed, state.isDemo]);
+
   const handleStayIn = () => {
     if (!buttonVisible) return;
     
@@ -302,9 +370,31 @@ export default function Home() {
           STAYPOOL
         </h1>
         <p className="text-xl text-gray-300 mb-2">Click the button or DIE! 💀</p>
+        
+        {/* Wallet Connection */}
+        <div className="mb-4">
+          {!connected ? (
+            <WalletMultiButton className="!bg-gradient-to-r !from-purple-500 !to-pink-600 hover:!from-purple-600 hover:!to-pink-700" />
+          ) : (
+            <div className="flex items-center justify-center gap-4">
+              <div className="bg-green-500/20 border border-green-500 rounded-lg px-4 py-2">
+                <span className="text-green-400 font-semibold">
+                  ✅ Connected: {publicKey?.toString().slice(0, 4)}...{publicKey?.toString().slice(-4)}
+                </span>
+              </div>
+              <WalletDisconnectButton className="!bg-red-500 hover:!bg-red-600 !text-white !font-semibold !px-4 !py-2 !rounded-lg !text-sm" />
+            </div>
+          )}
+        </div>
+        
         {state.isDemo && (
           <div className="inline-block bg-yellow-500/20 border border-yellow-500 rounded-lg px-4 py-2">
             <span className="text-yellow-400 font-semibold">🎮 DEMO MODE</span>
+          </div>
+        )}
+        {!state.isDemo && !connected && (
+          <div className="inline-block bg-red-500/20 border border-red-500 rounded-lg px-4 py-2">
+            <span className="text-red-400 font-semibold">⚠️ CONNECT WALLET TO PLAY</span>
           </div>
         )}
       </div>
@@ -345,9 +435,10 @@ export default function Home() {
                 </p>
                 <button
                   onClick={startDemo}
-                  className="bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-600 hover:to-purple-700 text-white font-bold py-4 px-8 rounded-xl text-xl transition-all duration-200 transform hover:scale-105"
+                  disabled={!state.isDemo && !connected}
+                  className="bg-gradient-to-r from-cyan-500 to-purple-600 hover:from-cyan-600 hover:to-purple-700 text-white font-bold py-4 px-8 rounded-xl text-xl transition-all duration-200 transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Start Demo Game
+                                          {state.isDemo ? 'Start Demo Game' : 'Join Game (0.05 SOL)'}
                 </button>
               </div>
             ) : (
@@ -444,10 +535,10 @@ export default function Home() {
                 <div className="text-3xl font-bold text-yellow-400 mb-2">{state.winner.name}</div>
                 <div className="text-xl text-gray-300 mb-4">WINS THE PRIZE POOL!</div>
                 <div className="text-4xl font-black text-green-400 animate-pulse">
-                  💰 {(state.prizePool * 0.9).toFixed(2)} STAY
+                  💰 {state.isDemo ? (state.prizePool * 0.9).toFixed(2) + ' STAY' : '100 DUMMY'}
                 </div>
                 <div className="text-sm text-gray-400 mt-2">
-                  (10% goes to treasury)
+                  {state.isDemo ? '(10% goes to treasury)' : tokensDistributed ? '✅ Tokens sent to wallet!' : '⏳ Sending tokens...'}
                 </div>
               </div>
             ) : (
@@ -462,6 +553,7 @@ export default function Home() {
                   setPlayerAlive(true);
                   setGameTime(0);
                   setLastCycle(0);
+                  setTokensDistributed(false);
                   npcEliminationRef.current = {};
                   clearTimers();
                 }}
