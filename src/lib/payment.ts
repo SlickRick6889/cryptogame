@@ -1,21 +1,94 @@
 import { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { WalletContextState } from '@solana/wallet-adapter-react';
+import { gameFunction } from './firebase';
 
-// Treasury wallet where entry fees are sent
-const TREASURY_WALLET = '5RM2ALYEPFSXUfuYfBiZtg4fxfvm6XMa7Mgyjkjk5We4';
+// Helper function to format token amounts with decimals
+function formatTokenAmount(rawAmount: string | number, decimals: number = 9): string {
+  const amount = typeof rawAmount === 'string' ? parseInt(rawAmount) : rawAmount;
+  const formatted = (amount / Math.pow(10, decimals)).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 6
+  });
+  return formatted;
+}
 
-// Game configuration
-const ENTRY_FEE_SOL = 0.05; // 0.05 SOL entry fee
-const DEVNET_RPC = 'https://api.devnet.solana.com';
-
-// Test token for prizes (DUMMY token from Credix faucet)
-const PRIZE_TOKEN_MINT = 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr';
+interface GameConfig {
+  network: 'devnet' | 'mainnet';
+  rpcUrl?: string;
+  treasuryAddress?: string;
+  tokenSymbol: string;
+  entryFee: number;
+  maxPlayersPerGame: number;
+  autoStartNewGames: boolean;
+}
 
 export class PaymentService {
-  private connection: Connection;
-  
+  private connection: Connection | null = null;
+  private config: GameConfig | null = null;
+  private treasuryWallet: string = '';
+
   constructor() {
-    this.connection = new Connection(DEVNET_RPC, 'confirmed');
+    this.loadConfig();
+  }
+
+  /**
+   * Load configuration from Firebase
+   */
+  async loadConfig(): Promise<GameConfig> {
+    if (this.config) {
+      return this.config;
+    }
+
+    try {
+      console.log('🔧 Loading game configuration from Firebase...');
+      
+      // Call gameFunction with getConfig action
+      const result = await gameFunction({
+        action: 'getConfig'
+      });
+      
+      const data = result.data as any;
+      if (data?.success && data?.config) {
+        this.config = data.config as GameConfig;
+        
+        // Set treasury wallet from Firebase config
+        this.treasuryWallet = this.config.treasuryAddress || '';
+        if (!this.treasuryWallet) {
+          throw new Error('Treasury wallet address not configured in Firebase');
+        }
+        
+        // Initialize connection
+        const rpcUrl = this.config.rpcUrl || 'https://mainnet.helius-rpc.com/?api-key=f10bbc12-c465-44a6-8064-ff3113d3c389';
+        this.connection = new Connection(rpcUrl, 'confirmed');
+        
+        console.log('✅ Configuration loaded:', this.config);
+        console.log('🔗 Using RPC endpoint:', rpcUrl);
+        return this.config;
+      } else {
+        throw new Error('Failed to load configuration from Firebase');
+      }
+    } catch (error) {
+      console.error('❌ Error loading config:', error);
+      // Fallback config
+      this.config = {
+        network: 'mainnet',
+        rpcUrl: 'https://mainnet.helius-rpc.com/?api-key=f10bbc12-c465-44a6-8064-ff3113d3c389',
+        tokenSymbol: 'BALL',
+        entryFee: 0.01,
+        maxPlayersPerGame: 1,
+        autoStartNewGames: true
+      };
+      this.connection = new Connection(this.config.rpcUrl!, 'confirmed');
+      return this.config;
+    }
+  }
+
+  /**
+   * Get current entry fee
+   */
+  async getEntryFee(): Promise<number> {
+    const config = await this.loadConfig();
+    return config?.entryFee || 0.01;
   }
 
   /**
@@ -26,15 +99,20 @@ export class PaymentService {
       throw new Error('Wallet not connected');
     }
 
+    const config = await this.loadConfig();
+    if (!this.connection) {
+      throw new Error('Connection not initialized');
+    }
+
     try {
-      console.log('💰 Charging entry fee:', ENTRY_FEE_SOL, 'SOL');
+      console.log('💰 Charging entry fee:', config.entryFee, 'SOL');
       
       // Create transfer instruction
-      const treasuryPublicKey = new PublicKey(TREASURY_WALLET);
+      const treasuryPublicKey = new PublicKey(this.treasuryWallet);
       const transferInstruction = SystemProgram.transfer({
         fromPubkey: wallet.publicKey,
         toPubkey: treasuryPublicKey,
-        lamports: ENTRY_FEE_SOL * LAMPORTS_PER_SOL
+        lamports: config.entryFee * LAMPORTS_PER_SOL
       });
 
       // Create transaction
@@ -62,73 +140,27 @@ export class PaymentService {
   }
 
   /**
-   * Distribute tokens to winner (calls Firebase function)
-   */
-  async distributeTokensToWinner(winnerWallet: string, gameId: string): Promise<boolean> {
-    try {
-      console.log('🏆 Distributing tokens to winner:', winnerWallet);
-      
-      // This would call our Firebase function to handle token distribution
-      const response = await fetch('https://us-central1-website-6889.cloudfunctions.net/distributeTokensToWinners', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          data: {
-            gameId,
-            winners: [winnerWallet],
-            tokenAmountPerWinner: 100, // 100 DUMMY tokens
-            tokenMint: PRIZE_TOKEN_MINT
-          }
-        }),
-      });
-
-      const result = await response.json();
-      
-      if (result.result?.success) {
-        console.log('✅ Tokens distributed successfully!');
-        return true;
-      } else {
-        console.error('❌ Token distribution failed:', result);
-        return false;
-      }
-      
-    } catch (error) {
-      console.error('❌ Error distributing tokens:', error);
-      return false;
-    }
-  }
-
-  /**
    * Record game payment in Firebase
    */
   async recordGamePayment(playerWallet: string, gameId: string, signature: string): Promise<boolean> {
     try {
       console.log('📝 Recording game payment...');
+      const config = await this.loadConfig();
       
-      const response = await fetch('https://us-central1-website-6889.cloudfunctions.net/recordGamePayment', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          data: {
-            playerWallet,
-            gameId,
-            feeAmount: ENTRY_FEE_SOL,
-            transactionSignature: signature
-          }
-        }),
+      // Call gameFunction with recordPayment action
+      const result = await gameFunction({
+        action: 'recordPayment',
+        playerAddress: playerWallet,
+        gameId,
+        transactionSignature: signature
       });
-
-      const result = await response.json();
       
-      if (result.result?.success) {
+      const data = result.data as any;
+      if (data?.success) {
         console.log('✅ Payment recorded successfully!');
         return true;
       } else {
-        console.error('❌ Payment recording failed:', result);
+        console.error('❌ Payment recording failed:', JSON.stringify(data, null, 2));
         return false;
       }
       
@@ -139,15 +171,87 @@ export class PaymentService {
   }
 
   /**
+   * Start game and trigger token purchase via Jupiter swap
+   */
+  async startGameAndPrepareTokens(gameId: string, totalPlayers: number): Promise<{ success: boolean; swapCompleted: boolean; ballTokensAvailable?: number; swapSignature?: string }> {
+    try {
+      console.log('🎮 Starting game and performing Jupiter swap...');
+      
+      // Call gameFunction with startGame action
+      const result = await gameFunction({
+        action: 'startGame',
+        gameId,
+        totalPlayers
+      });
+      
+      const data = result.data as any;
+      if (data?.success) {
+        console.log('✅ Game started and Jupiter swap completed!', data.message);
+        
+        // Check if swap was successful
+        const swapCompleted = !data.swapFailed && data.swapSignature;
+        
+        return {
+          success: true,
+          swapCompleted,
+          ballTokensAvailable: data.ballTokensAvailable || 0,
+          swapSignature: data.swapSignature
+        };
+      } else {
+        console.error('❌ Game start failed:', JSON.stringify(data, null, 2));
+        return { success: false, swapCompleted: false };
+      }
+      
+    } catch (error) {
+      console.error('❌ Error starting game:', error);
+      return { success: false, swapCompleted: false };
+    }
+  }
+
+  /**
+   * Distribute tokens to winner
+   */
+  async distributeTokensToWinner(winnerWallet: string, gameId: string): Promise<any> {
+    try {
+      console.log('🏆 Distributing tokens to winner:', winnerWallet);
+      
+      // Call gameFunction with distributeTokens action
+      const result = await gameFunction({
+        action: 'distributeTokens',
+        gameId,
+        winnerAddress: winnerWallet
+      });
+      
+      const data = result.data as any;
+      if (data?.success) {
+        console.log('✅ Tokens distributed successfully!');
+        return data;
+      } else {
+        console.error('❌ Token distribution failed:', JSON.stringify(data, null, 2));
+        return { success: false, error: data };
+      }
+      
+    } catch (error) {
+      console.error('❌ Error distributing tokens:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Check if wallet has enough SOL for entry fee
    */
   async checkWalletBalance(publicKey: PublicKey): Promise<{ hasEnough: boolean; balance: number }> {
+    const config = await this.loadConfig();
+    if (!this.connection) {
+      throw new Error('Connection not initialized');
+    }
+
     try {
       const balance = await this.connection.getBalance(publicKey);
       const solBalance = balance / LAMPORTS_PER_SOL;
       
       return {
-        hasEnough: solBalance >= ENTRY_FEE_SOL + 0.01, // Entry fee + transaction fee
+        hasEnough: solBalance >= config.entryFee + 0.01, // Entry fee + transaction fee
         balance: solBalance
       };
     } catch (error) {

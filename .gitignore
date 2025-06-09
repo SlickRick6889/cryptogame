@@ -68,3 +68,31 @@ jspm_packages/
 
 # Stores VSCode versions used for testing VSCode extensions
 .vscode-test 
+
+# Security - Private keys and sensitive files
+*.key
+*.pem
+treasury-wallet.json
+dev-wallet.json
+**/private-key*
+**/secret*
+**/*private*
+**/*secret*
+
+# Firebase config
+.firebaserc.local
+firebase-debug.log
+.firebase/
+
+# Solana keypairs
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!next.config.js
+!tailwind.config.js
+!postcss.config.js
+
+# Test files with sensitive data
+test_*private*
+*_private_*

@@ -1,17 +1,12 @@
 'use client';
-
 import React, { useMemo } from 'react';
 import { ConnectionProvider, WalletProvider } from '@solana/wallet-adapter-react';
 import { WalletAdapterNetwork } from '@solana/wallet-adapter-base';
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
-import {
-  PhantomWalletAdapter,
-  SolflareWalletAdapter,
-} from '@solana/wallet-adapter-wallets';
-import { clusterApiUrl } from '@solana/web3.js';
+import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
+import { SolflareWalletAdapter } from '@solana/wallet-adapter-solflare';
 import { GameProvider } from '@/contexts/GameContext';
 
-// Import wallet adapter CSS
 require('@solana/wallet-adapter-react-ui/styles.css');
 
 interface ProvidersProps {
@@ -19,13 +14,13 @@ interface ProvidersProps {
 }
 
 export default function Providers({ children }: ProvidersProps) {
-  // The network can be set to 'devnet', 'testnet', or 'mainnet-beta'.
-  const network = WalletAdapterNetwork.Devnet;
+  // Use mainnet for production
+  const network = WalletAdapterNetwork.Mainnet;
   
-  // You can also provide a custom RPC endpoint.
+  // Use mainnet RPC endpoint
   const endpoint = useMemo(() => 
-    'https://api.devnet.solana.com', // Hardcode devnet for testing
-    [network]
+    'https://mainnet.helius-rpc.com/?api-key=f10bbc12-c465-44a6-8064-ff3113d3c389',
+    []
   );
 
   const wallets = useMemo(
@@ -38,7 +33,13 @@ export default function Providers({ children }: ProvidersProps) {
 
   return (
     <ConnectionProvider endpoint={endpoint}>
-      <WalletProvider wallets={wallets} autoConnect>
+      <WalletProvider 
+        wallets={wallets} 
+        autoConnect={false}
+        onError={(error) => {
+          console.error('Wallet error:', error);
+        }}
+      >
         <WalletModalProvider>
           <GameProvider>
             {children}

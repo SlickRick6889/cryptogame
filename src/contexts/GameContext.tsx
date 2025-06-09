@@ -1,8 +1,6 @@
 'use client';
-
 import React, { createContext, useContext, useReducer, useEffect } from 'react';
 
-// Game types
 export type GamePhase = 'lobby' | 'playing' | 'results';
 export type PlayerStatus = 'alive' | 'eliminated';
 
@@ -10,10 +8,8 @@ export interface Player {
   id: string;
   wallet: string;
   name: string;
-  avatar?: string;
   status: PlayerStatus;
   isNPC?: boolean;
-  personality?: string;
 }
 
 export interface GameState {
@@ -36,6 +32,7 @@ type GameAction =
   | { type: 'ELIMINATE_PLAYER'; payload: { playerId: string } }
   | { type: 'END_GAME'; payload: { winner: Player } }
   | { type: 'TICK_TIMER' }
+  | { type: 'SET_DEMO_MODE'; payload: { isDemo: boolean } }
   | { type: 'RESET_GAME' };
 
 // Initial state
@@ -45,9 +42,9 @@ const initialState: GameState = {
   currentRound: 0,
   maxRounds: 10,
   prizePool: 0,
-  entryFee: 0.05, // SOL
+  entryFee: 0.01,
   roundTimer: 30,
-  isDemo: process.env.NEXT_PUBLIC_DEMO_MODE !== 'false', // Read from environment
+  isDemo: typeof window !== 'undefined' ? process.env.NEXT_PUBLIC_DEMO_MODE === 'true' : false,
 };
 
 // Game reducer
@@ -57,7 +54,7 @@ function gameReducer(state: GameState, action: GameAction): GameState {
       return {
         ...state,
         players: [...state.players, action.payload.player],
-        prizePool: state.prizePool + 1000, // 1000 STAY tokens per player
+        prizePool: state.prizePool + 1000,
       };
 
     case 'START_GAME':
@@ -84,7 +81,6 @@ function gameReducer(state: GameState, action: GameAction): GameState {
       
       const alivePlayers = updatedPlayers.filter(p => p.status === 'alive');
       
-      // Check if game should end
       if (alivePlayers.length <= 1) {
         return {
           ...state,
@@ -110,6 +106,12 @@ function gameReducer(state: GameState, action: GameAction): GameState {
       return {
         ...state,
         roundTimer: Math.max(0, state.roundTimer - 1),
+      };
+
+    case 'SET_DEMO_MODE':
+      return {
+        ...state,
+        isDemo: action.payload.isDemo,
       };
 
     case 'RESET_GAME':
@@ -138,43 +140,29 @@ const GameContext = createContext<GameContextType | undefined>(undefined);
 export function GameProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(gameReducer, initialState);
 
-  // Timer effect - disabled since we handle timing in the main component
-  // useEffect(() => {
-  //   if (state.phase === 'playing' && state.roundTimer > 0) {
-  //     const timer = setInterval(() => {
-  //       dispatch({ type: 'TICK_TIMER' });
-  //     }, 1000);
-  //     
-  //     return () => clearInterval(timer);
-  //   } else if (state.phase === 'playing' && state.roundTimer === 0) {
-  //     // Round ended, eliminate random players or advance
-  //     const alivePlayers = state.players.filter(p => p.status === 'alive');
-  //     if (alivePlayers.length > 1) {
-  //       // In demo mode, eliminate some random players
-  //       if (state.isDemo) {
-  //         const toEliminate = Math.floor(alivePlayers.length * 0.3); // Eliminate 30%
-  //         for (let i = 0; i < toEliminate; i++) {
-  //           const randomPlayer = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
-  //           if (randomPlayer && !randomPlayer.isNPC) continue; // Don't eliminate real player in demo
-  //           dispatch({ type: 'ELIMINATE_PLAYER', payload: { playerId: randomPlayer.id } });
-  //         }
-  //       }
-  //       dispatch({ type: 'NEXT_ROUND' });
-  //     }
-  //   }
-  // }, [state.phase, state.roundTimer, state.players]);
+  // Set demo mode after hydration
+  useEffect(() => {
+    const isDemoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
+    dispatch({ type: 'SET_DEMO_MODE', payload: { isDemo: isDemoMode } });
+  }, []); // Run only once on mount
 
   const contextValue: GameContextType = {
     state,
-    joinGame: (player) => dispatch({ type: 'JOIN_GAME', payload: { player } }),
+    joinGame: (player) => {
+      // No NPCs for simple testing
+      if (player.isNPC) {
+        console.log('🚫 Skipping NPC addition for simple testing:', player.name);
+        return;
+      }
+      dispatch({ type: 'JOIN_GAME', payload: { player } });
+    },
     startGame: () => dispatch({ type: 'START_GAME' }),
     nextRound: () => dispatch({ type: 'NEXT_ROUND' }),
     eliminatePlayer: (playerId) => dispatch({ type: 'ELIMINATE_PLAYER', payload: { playerId } }),
     endGame: (winner) => dispatch({ type: 'END_GAME', payload: { winner } }),
     resetGame: () => dispatch({ type: 'RESET_GAME' }),
     stayIn: () => {
-      // This function is not used in our current implementation
-      // All button logic is handled in the main component
+      // Simple implementation - handled in main component
     },
   };
 

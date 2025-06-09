@@ -32,290 +32,511 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __rest = (this && this.__rest) || function (s, e) {
+    var t = {};
+    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
+        t[p] = s[p];
+    if (s != null && typeof Object.getOwnPropertySymbols === "function")
+        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {
+            if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))
+                t[p[i]] = s[p[i]];
+        }
+    return t;
+};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.buyTokensManually = exports.distributeTokensToWinners = exports.getTreasuryStatus = exports.testFunction = exports.recordGamePayment = exports.monitorDevWallet = void 0;
+exports.debugConfig = exports.gameFunction = void 0;
 const functions = __importStar(require("firebase-functions"));
 const admin = __importStar(require("firebase-admin"));
 const web3_js_1 = require("@solana/web3.js");
 const spl_token_1 = require("@solana/spl-token");
+const bs58 = __importStar(require("bs58"));
 const axios_1 = __importDefault(require("axios"));
-const bs58_1 = __importDefault(require("bs58"));
 admin.initializeApp();
 const db = admin.firestore();
-// Solana configuration
-const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
-const connection = new web3_js_1.Connection(SOLANA_RPC, 'confirmed');
-// DEV wallet configuration (TEST treasury wallet for devnet)
-const DEV_WALLET_PRIVATE_KEY = process.env.DEV_WALLET_PRIVATE_KEY || '5GwBJRCsJngiDp3JuPzFNtaCfHLwMQ6Thf2xPdiBjZwZNNLRkYQLMquoVevmocVmctBm14K7mP4TXggz9vnMS2cp'; // Test wallet private key
-const STAY_TOKEN_MINT = process.env.STAY_TOKEN_MINT || 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'; // DUMMY token from Credix faucet
-// Initialize DEV wallet
-function getDevWallet() {
-    if (!DEV_WALLET_PRIVATE_KEY) {
-        throw new Error('DEV wallet private key not configured');
-    }
-    return web3_js_1.Keypair.fromSecretKey(bs58_1.default.decode(DEV_WALLET_PRIVATE_KEY));
+// Jupiter V6 API Configuration
+const JUPITER_API_URL = 'https://quote-api.jup.ag/v6';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+// Helper function to format token amounts with decimals
+function formatTokenAmount(rawAmount, decimals = 9) {
+    const amount = typeof rawAmount === 'string' ? parseInt(rawAmount) : rawAmount;
+    const formatted = (amount / Math.pow(10, decimals)).toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 6
+    });
+    return formatted;
 }
-// 💰 MONITOR DEV WALLET FOR INCOMING PAYMENTS  
-exports.monitorDevWallet = functions.pubsub.schedule('every 1 minutes').onRun(async (context) => {
-    var _a;
-    console.log('🔍 Monitoring DEV wallet for game payments...');
+// Helper function to detect if token uses Token2022 program
+async function getTokenProgramId(connection, tokenMint) {
     try {
-        const devWallet = getDevWallet();
-        const devPublicKey = devWallet.publicKey;
-        // Get current SOL balance
-        const currentBalance = await connection.getBalance(devPublicKey);
-        const currentSol = currentBalance / web3_js_1.LAMPORTS_PER_SOL;
-        console.log(`📊 DEV wallet balance: ${currentSol} SOL`);
-        // Get last recorded balance from Firestore
-        const balanceDoc = await db.collection('treasury').doc('balance').get();
-        const lastBalance = balanceDoc.exists ? ((_a = balanceDoc.data()) === null || _a === void 0 ? void 0 : _a.solBalance) || 0 : 0;
-        // If balance increased, new payments came in!
-        if (currentSol > lastBalance) {
-            const newSol = currentSol - lastBalance;
-            console.log(`💰 New game payments detected: ${newSol} SOL`);
-            // Update recorded balance
-            await db.collection('treasury').doc('balance').set({
-                solBalance: currentSol,
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-            });
+        const mintInfo = await connection.getAccountInfo(new web3_js_1.PublicKey(tokenMint));
+        if (mintInfo === null || mintInfo === void 0 ? void 0 : mintInfo.owner.equals(spl_token_1.TOKEN_2022_PROGRAM_ID)) {
+            console.log('🔍 Detected Token2022 program for BALL token');
+            return spl_token_1.TOKEN_2022_PROGRAM_ID;
+        }
+        else {
+            console.log('🔍 Detected legacy SPL Token program for BALL token');
+            return spl_token_1.TOKEN_PROGRAM_ID;
         }
     }
     catch (error) {
-        console.error('Error monitoring DEV wallet:', error);
-    }
-});
-// 🤖 AUTOMATIC TOKEN PURCHASE WITH GAME PAYMENTS
-async function buyStayTokensWithPayments(solAmount) {
-    try {
-        console.log(`🤖 Auto-buying STAY tokens with game payments: ${solAmount} SOL`);
-        const devWallet = getDevWallet();
-        // Keep some SOL for transaction fees (0.01 SOL)
-        const solToSpend = solAmount - 0.01;
-        if (solToSpend <= 0) {
-            console.log('Not enough SOL to purchase tokens after fees');
-            return;
-        }
-        // Get Jupiter quote for SOL → STAY token
-        const jupiterQuote = await axios_1.default.get('https://quote-api.jup.ag/v6/quote', {
-            params: {
-                inputMint: 'So11111111111111111111111111111111111111112', // SOL
-                outputMint: STAY_TOKEN_MINT,
-                amount: Math.floor(solToSpend * web3_js_1.LAMPORTS_PER_SOL),
-                slippageBps: 300 // 3% slippage
-            }
-        });
-        if (!jupiterQuote.data) {
-            throw new Error('No quote from Jupiter');
-        }
-        // Get swap transaction
-        const { data: swapTransaction } = await axios_1.default.post('https://quote-api.jup.ag/v6/swap', {
-            quoteResponse: jupiterQuote.data,
-            userPublicKey: devWallet.publicKey.toString(),
-            wrapAndUnwrapSol: true
-        });
-        // Sign and send transaction
-        const swapTransactionBuf = Buffer.from(swapTransaction.swapTransaction, 'base64');
-        const transaction = web3_js_1.Transaction.from(swapTransactionBuf);
-        transaction.sign(devWallet);
-        const signature = await connection.sendRawTransaction(transaction.serialize());
-        console.log(`✅ STAY token purchase successful! Signature: ${signature}`);
-        // Record the transaction
-        await db.collection('tokenPurchases').add({
-            type: 'auto_purchase_from_game_fees',
-            solAmount: solToSpend,
-            stayTokensReceived: jupiterQuote.data.outAmount,
-            signature,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
-        // Update total token balance
-        await db.collection('treasury').doc('tokens').set({
-            stayTokenBalance: admin.firestore.FieldValue.increment(jupiterQuote.data.outAmount),
-            lastPurchase: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-    }
-    catch (error) {
-        console.error('Error in automatic token purchase:', error);
+        console.log('⚠️ Could not detect token program, defaulting to SPL Token');
+        return spl_token_1.TOKEN_PROGRAM_ID;
     }
 }
-// 🎮 RECORD GAME PAYMENT (Called when player pays fee)
-exports.recordGamePayment = functions.https.onCall(async (data, context) => {
+// Helper function to get configuration from Firestore
+async function getGameConfig() {
+    var _a, _b, _c;
     try {
-        const { playerWallet, gameId, feeAmount, transactionSignature } = data;
-        // Verify the transaction actually happened
-        const txInfo = await connection.getTransaction(transactionSignature);
-        if (!txInfo) {
-            throw new functions.https.HttpsError('invalid-argument', 'Transaction not found');
+        const configDoc = await db.collection('config').doc('game').get();
+        const configData = configDoc.exists ? configDoc.data() : {};
+        // Get treasury private key from Firebase Functions config
+        const privateKey = (_a = functions.config().treasury) === null || _a === void 0 ? void 0 : _a.pk;
+        if (!privateKey) {
+            throw new Error('Treasury private key not configured');
         }
-        // Record the payment
-        await db.collection('gamePayments').add({
-            playerWallet,
-            gameId,
-            feeAmount,
-            transactionSignature,
-            status: 'confirmed',
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        // Get BALL token mint
+        const ballTokenDoc = await db.collection('tokenID').doc('BALL').get();
+        const ballToken = ballTokenDoc.exists ? ballTokenDoc.data() : {};
+        // Use tokenMint from config/game, or fall back to BALL token mintAddress
+        const tokenMint = (configData === null || configData === void 0 ? void 0 : configData.tokenMint) || (ballToken === null || ballToken === void 0 ? void 0 : ballToken.mintAddress);
+        if (!tokenMint) {
+            console.log('⚠️ Token mint not found in Firestore, using default BALL token');
+        }
+        // Default configuration with Firestore overrides
+        const config = {
+            network: (configData === null || configData === void 0 ? void 0 : configData.network) || 'mainnet',
+            rpcUrl: (configData === null || configData === void 0 ? void 0 : configData.rpcUrl) || 'https://api.mainnet-beta.solana.com',
+            treasuryWallet: privateKey,
+            tokenMint: tokenMint || 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y',
+            entryFee: (configData === null || configData === void 0 ? void 0 : configData.entryFee) || 0.01,
+            maxPlayersPerGame: (configData === null || configData === void 0 ? void 0 : configData.maxPlayersPerGame) || 1,
+            autoStartNewGames: (_b = configData === null || configData === void 0 ? void 0 : configData.autoStartNewGames) !== null && _b !== void 0 ? _b : true,
+            isProduction: (_c = configData === null || configData === void 0 ? void 0 : configData.isProduction) !== null && _c !== void 0 ? _c : false
+        };
+        console.log('✅ Game configuration loaded:', {
+            network: config.network,
+            rpcUrl: config.rpcUrl ? 'SET' : 'NOT SET',
+            tokenMint: config.tokenMint ? 'SET' : 'NOT SET',
+            entryFee: config.entryFee
         });
-        console.log(`🎮 Game payment recorded: ${feeAmount} SOL from ${playerWallet}`);
-        return { success: true, message: 'Payment recorded successfully' };
+        return config;
     }
     catch (error) {
-        console.error('Error recording game payment:', error);
-        throw new functions.https.HttpsError('internal', 'Failed to record payment');
+        console.error('❌ Error getting game config:', error);
+        throw error;
     }
-});
-// 🧪 SIMPLE TEST FUNCTION
-exports.testFunction = functions.https.onCall(async (data, context) => {
+}
+// Helper function to perform Jupiter swap
+async function performJupiterSwap(connection, treasuryWallet, solAmount, tokenMint) {
+    var _a, _b, _c, _d;
     try {
-        return {
-            success: true,
-            message: 'Test function working!',
-            timestamp: new Date().toISOString(),
-            config: {
-                solana_rpc: SOLANA_RPC,
-                stay_token_mint: STAY_TOKEN_MINT,
-                has_private_key: !!DEV_WALLET_PRIVATE_KEY
+        console.log(`🔄 Starting Jupiter swap: ${solAmount} SOL → BALL tokens`);
+        console.log(`📊 Using token mint: ${tokenMint}`);
+        // Convert SOL amount to lamports
+        const amountInLamports = Math.floor(solAmount * web3_js_1.LAMPORTS_PER_SOL);
+        console.log(`💰 Amount to swap: ${amountInLamports} lamports (${solAmount} SOL)`);
+        // Step 1: Get quote from Jupiter API
+        const quoteParams = new URLSearchParams({
+            inputMint: SOL_MINT,
+            outputMint: tokenMint,
+            amount: amountInLamports.toString(),
+            slippageBps: '300', // 3% slippage tolerance
+            swapMode: 'ExactIn',
+            maxAccounts: '64'
+        });
+        console.log(`🔍 Getting Jupiter quote...`);
+        const quoteUrl = `${JUPITER_API_URL}/quote?${quoteParams}`;
+        console.log(`📡 Quote URL: ${quoteUrl}`);
+        const quoteResponse = await axios_1.default.get(quoteUrl, {
+            timeout: 10000,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
             }
-        };
-    }
-    catch (error) {
-        console.error('Error in test function:', error);
-        throw new functions.https.HttpsError('internal', 'Test function failed');
-    }
-});
-// 📊 GET TREASURY STATUS
-exports.getTreasuryStatus = functions.https.onCall(async (data, context) => {
-    var _a;
-    try {
-        const devWallet = getDevWallet();
-        const devPublicKey = devWallet.publicKey;
-        // Get live SOL balance
-        const solBalance = await connection.getBalance(devPublicKey);
-        const solAmount = solBalance / web3_js_1.LAMPORTS_PER_SOL;
-        // Get token balance from Firestore
-        const tokenDoc = await db.collection('treasury').doc('tokens').get();
-        const tokenBalance = tokenDoc.exists ? ((_a = tokenDoc.data()) === null || _a === void 0 ? void 0 : _a.stayTokenBalance) || 0 : 0;
-        // Get recent purchases
-        const purchasesSnapshot = await db.collection('tokenPurchases')
-            .orderBy('timestamp', 'desc')
-            .limit(10)
-            .get();
-        const recentPurchases = purchasesSnapshot.docs.map(doc => doc.data());
-        return {
-            success: true,
-            treasury: {
-                devWalletAddress: devPublicKey.toString(),
-                solBalance: solAmount,
-                stayTokenBalance: tokenBalance,
-                recentPurchases
-            }
-        };
-    }
-    catch (error) {
-        console.error('Error getting treasury status:', error);
-        throw new functions.https.HttpsError('internal', 'Failed to get treasury status');
-    }
-});
-// 🎯 DISTRIBUTE TOKENS TO PLAYERS (After game ends)
-exports.distributeTokensToWinners = functions.https.onCall(async (data, context) => {
-    try {
-        const { gameId, winners, tokenAmountPerWinner, tokenMint } = data;
-        console.log(`🏆 Starting token distribution for game ${gameId}`);
-        console.log(`Winners: ${winners.length}, Amount each: ${tokenAmountPerWinner}, Token: ${tokenMint}`);
-        const devWallet = getDevWallet();
-        const tokenMintPubkey = new web3_js_1.PublicKey(tokenMint || STAY_TOKEN_MINT);
-        // Get dev wallet's token account
-        const devTokenAccount = await (0, spl_token_1.getAssociatedTokenAddress)(tokenMintPubkey, devWallet.publicKey);
-        const results = [];
-        // Send tokens to each winner
-        for (const winnerAddress of winners) {
-            try {
-                console.log(`💰 Sending ${tokenAmountPerWinner} DUMMY tokens to ${winnerAddress}`);
-                const winnerPubkey = new web3_js_1.PublicKey(winnerAddress);
-                // Get or create winner's token account
-                const winnerTokenAccount = await (0, spl_token_1.getAssociatedTokenAddress)(tokenMintPubkey, winnerPubkey);
-                // Check if winner's token account exists
-                const accountInfo = await connection.getAccountInfo(winnerTokenAccount);
-                const transaction = new web3_js_1.Transaction();
-                // Create token account if it doesn't exist
-                if (!accountInfo) {
-                    console.log(`📝 Creating token account for winner: ${winnerAddress}`);
-                    const createAccountInstruction = (0, spl_token_1.createAssociatedTokenAccountInstruction)(devWallet.publicKey, // payer
-                    winnerTokenAccount, // account to create
-                    winnerPubkey, // owner
-                    tokenMintPubkey // mint
-                    );
-                    transaction.add(createAccountInstruction);
+        });
+        if (!quoteResponse.data) {
+            throw new Error('No quote received from Jupiter');
+        }
+        const quote = quoteResponse.data;
+        console.log(`✅ Jupiter quote received:`, {
+            inputAmount: quote.inAmount,
+            outputAmount: quote.outAmount,
+            priceImpactPct: quote.priceImpactPct,
+            route: ((_a = quote.routePlan) === null || _a === void 0 ? void 0 : _a.length) || 0 + ' steps'
+        });
+        // Step 2: Get swap transaction from Jupiter
+        console.log(`🏗️ Getting swap transaction from Jupiter...`);
+        console.log(`🎯 Let Jupiter auto-detect Token2022 and handle all account creation`);
+        const swapResponse = await axios_1.default.post(`${JUPITER_API_URL}/swap`, {
+            quoteResponse: quote,
+            userPublicKey: treasuryWallet.publicKey.toString(),
+            wrapAndUnwrapSol: true,
+            dynamicComputeUnitLimit: true,
+            dynamicSlippage: { maxBps: 500 }, // Allow up to 5% slippage for better success rate
+            prioritizationFeeLamports: {
+                priorityLevelWithMaxLamports: {
+                    maxLamports: 10000000,
+                    priorityLevel: "high"
                 }
-                // Add transfer instruction
-                const transferInstruction = (0, spl_token_1.createTransferInstruction)(devTokenAccount, // source
-                winnerTokenAccount, // destination  
-                devWallet.publicKey, // owner
-                tokenAmountPerWinner * Math.pow(10, 6), // amount (DUMMY tokens have 6 decimals)
-                [], // signers
-                spl_token_1.TOKEN_PROGRAM_ID);
-                transaction.add(transferInstruction);
-                // Get recent blockhash and send transaction
-                const { blockhash } = await connection.getLatestBlockhash();
-                transaction.recentBlockhash = blockhash;
-                transaction.feePayer = devWallet.publicKey;
-                // Sign and send
-                transaction.sign(devWallet);
-                const signature = await connection.sendRawTransaction(transaction.serialize());
-                console.log(`✅ Tokens sent to ${winnerAddress}! Signature: ${signature}`);
-                // Wait for confirmation
-                await connection.confirmTransaction(signature, 'confirmed');
-                results.push({
-                    winner: winnerAddress,
-                    signature,
-                    amount: tokenAmountPerWinner,
-                    status: 'success'
-                });
             }
-            catch (error) {
-                console.error(`❌ Failed to send tokens to ${winnerAddress}:`, error);
-                results.push({
-                    winner: winnerAddress,
-                    error: error instanceof Error ? error.message : 'Unknown error',
-                    status: 'failed'
-                });
+        }, {
+            timeout: 15000, // Increase timeout
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
             }
-        }
-        // Record the distribution in Firestore
-        await db.collection('tokenDistributions').add({
-            gameId,
-            winners,
-            tokenAmountPerWinner,
-            tokenMint,
-            totalDistributed: winners.length * tokenAmountPerWinner,
-            results,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
         });
-        const successCount = results.filter(r => r.status === 'success').length;
-        console.log(`🎉 Token distribution complete: ${successCount}/${winners.length} successful`);
+        if (!((_b = swapResponse.data) === null || _b === void 0 ? void 0 : _b.swapTransaction)) {
+            throw new Error('No swap transaction received from Jupiter');
+        }
+        // Step 3: Deserialize and sign transaction
+        console.log(`✍️ Signing swap transaction...`);
+        const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
+        const transaction = web3_js_1.VersionedTransaction.deserialize(swapTransactionBuf);
+        // Sign the transaction
+        transaction.sign([treasuryWallet]);
+        // Step 4: Send transaction
+        console.log(`📤 Sending swap transaction to Solana...`);
+        const latestBlockHash = await connection.getLatestBlockhash();
+        const signature = await connection.sendRawTransaction(transaction.serialize(), {
+            skipPreflight: true,
+            maxRetries: 3
+        });
+        // Confirm transaction
+        console.log(`⏳ Confirming transaction: ${signature}`);
+        await connection.confirmTransaction({
+            blockhash: latestBlockHash.blockhash,
+            lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+            signature: signature
+        });
+        console.log(`🎉 Jupiter swap completed successfully!`);
+        console.log(`📝 Transaction: https://solscan.io/tx/${signature}`);
+        console.log(`💰 Swapped ${solAmount} SOL for ${quote.outAmount} BALL tokens`);
         return {
             success: true,
-            message: `Tokens distributed to ${successCount}/${winners.length} winners`,
-            results
+            signature,
+            inputAmount: quote.inAmount,
+            outputAmount: quote.outAmount,
+            priceImpactPct: quote.priceImpactPct
         };
     }
     catch (error) {
-        console.error('Error distributing tokens:', error);
-        throw new functions.https.HttpsError('internal', 'Failed to distribute tokens');
+        console.error('❌ Jupiter swap failed:', (error === null || error === void 0 ? void 0 : error.message) || error);
+        // Log more details for debugging
+        if ((_c = error === null || error === void 0 ? void 0 : error.response) === null || _c === void 0 ? void 0 : _c.data) {
+            console.error('🔍 Jupiter API error details:', error.response.data);
+        }
+        return {
+            success: false,
+            error: (error === null || error === void 0 ? void 0 : error.message) || 'Unknown error during Jupiter swap',
+            details: ((_d = error === null || error === void 0 ? void 0 : error.response) === null || _d === void 0 ? void 0 : _d.data) || null
+        };
     }
-});
-// 🔧 MANUAL TOKEN PURCHASE (For testing/manual triggers)
-exports.buyTokensManually = functions.https.onCall(async (data, context) => {
+}
+// ensureTreasuryTokenAccount function removed - Jupiter handles all account creation automatically
+// Helper function to distribute tokens to winner
+async function distributeTokens(connection, treasuryWallet, winnerAddress, tokenMintAddress, amount) {
     try {
-        const { solAmount } = data;
-        await buyStayTokensWithPayments(solAmount);
-        return { success: true, message: 'Manual token purchase initiated' };
+        const formattedAmount = formatTokenAmount(amount);
+        console.log(`🏆 Distributing ${formattedAmount} BALL tokens (${amount} raw) to winner: ${winnerAddress}`);
+        const tokenMintPubkey = new web3_js_1.PublicKey(tokenMintAddress);
+        const winnerPubkey = new web3_js_1.PublicKey(winnerAddress);
+        // Detect the correct token program
+        const tokenProgramId = await getTokenProgramId(connection, tokenMintAddress);
+        // Get associated token accounts with correct program
+        const treasuryTokenAccount = await (0, spl_token_1.getAssociatedTokenAddress)(tokenMintPubkey, treasuryWallet.publicKey, false, tokenProgramId);
+        const winnerTokenAccount = await (0, spl_token_1.getAssociatedTokenAddress)(tokenMintPubkey, winnerPubkey, false, tokenProgramId);
+        const instructions = [];
+        // Check if winner token account exists, create if needed
+        const winnerAccountInfo = await connection.getAccountInfo(winnerTokenAccount);
+        if (!winnerAccountInfo) {
+            console.log('📝 Creating winner token account...');
+            instructions.push((0, spl_token_1.createAssociatedTokenAccountInstruction)(treasuryWallet.publicKey, // payer
+            winnerTokenAccount, // ata
+            winnerPubkey, // owner
+            tokenMintPubkey, // mint
+            tokenProgramId // programId
+            ));
+        }
+        // Add transfer instruction - use transferChecked for Token2022
+        if (tokenProgramId.equals(spl_token_1.TOKEN_2022_PROGRAM_ID)) {
+            console.log('🔄 Using transferChecked for Token2022');
+            instructions.push((0, spl_token_1.createTransferCheckedInstruction)(treasuryTokenAccount, // from
+            tokenMintPubkey, // mint
+            winnerTokenAccount, // to
+            treasuryWallet.publicKey, // owner
+            amount, // amount
+            9, // decimals (BALL token has 9 decimals)
+            [], // multiSigners
+            tokenProgramId // programId
+            ));
+        }
+        else {
+            console.log('🔄 Using regular transfer for legacy SPL token');
+            instructions.push((0, spl_token_1.createTransferInstruction)(treasuryTokenAccount, // from
+            winnerTokenAccount, // to
+            treasuryWallet.publicKey, // owner
+            amount, // amount
+            [], // multiSigners
+            tokenProgramId // programId
+            ));
+        }
+        // Send transaction
+        const transaction = new web3_js_1.Transaction().add(...instructions);
+        const signature = await connection.sendTransaction(transaction, [treasuryWallet]);
+        await connection.confirmTransaction(signature);
+        console.log(`🎉 Token distribution completed! Transaction: ${signature}`);
+        return {
+            success: true,
+            signature,
+            amount
+        };
     }
     catch (error) {
-        console.error('Error in manual purchase:', error);
-        throw new functions.https.HttpsError('internal', 'Manual purchase failed');
+        console.error('❌ Token distribution failed:', error);
+        return {
+            success: false,
+            error: (error === null || error === void 0 ? void 0 : error.message) || 'Unknown error during token distribution'
+        };
+    }
+}
+// Main game function
+exports.gameFunction = functions.https.onCall(async (data, context) => {
+    try {
+        const { action, gameId, playerAddress, transactionSignature } = data, params = __rest(data, ["action", "gameId", "playerAddress", "transactionSignature"]);
+        const config = await getGameConfig();
+        const connection = new web3_js_1.Connection(config.rpcUrl, 'confirmed');
+        const treasuryWallet = web3_js_1.Keypair.fromSecretKey(bs58.decode(config.treasuryWallet));
+        console.log(`🎮 Game function called: ${action}`);
+        switch (action) {
+            case 'getConfig':
+                return {
+                    success: true,
+                    config: {
+                        network: config.network,
+                        rpcUrl: config.rpcUrl,
+                        treasuryAddress: treasuryWallet.publicKey.toString(),
+                        tokenSymbol: 'BALL',
+                        entryFee: config.entryFee,
+                        maxPlayersPerGame: config.maxPlayersPerGame,
+                        autoStartNewGames: config.autoStartNewGames,
+                        isProduction: config.isProduction
+                    }
+                };
+            case 'recordPayment':
+                try {
+                    console.log(`💰 Recording payment for game: ${gameId}`);
+                    // Record payment in Firestore
+                    const paymentData = {
+                        gameId,
+                        playerAddress,
+                        transactionSignature,
+                        amount: config.entryFee,
+                        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                        status: 'confirmed'
+                    };
+                    // Add to payments collection
+                    await db.collection('payments').add(paymentData);
+                    // Update game with payment info
+                    await db.collection('games').doc(gameId).set({
+                        players: admin.firestore.FieldValue.arrayUnion(playerAddress),
+                        totalSolCollected: admin.firestore.FieldValue.increment(config.entryFee),
+                        payments: admin.firestore.FieldValue.arrayUnion({
+                            player: playerAddress,
+                            signature: transactionSignature,
+                            amount: config.entryFee
+                        }),
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    console.log(`✅ Payment recorded successfully for ${playerAddress}`);
+                    return {
+                        success: true,
+                        message: 'Payment recorded successfully'
+                    };
+                }
+                catch (error) {
+                    console.error('❌ Error recording payment:', error);
+                    return {
+                        success: false,
+                        error: (error === null || error === void 0 ? void 0 : error.message) || 'Failed to record payment'
+                    };
+                }
+            case 'startGame':
+                try {
+                    console.log(`🎯 Starting new game and performing Jupiter swap...`);
+                    // Let Jupiter handle ALL account creation automatically
+                    console.log('🚀 Letting Jupiter handle all Token2022 account creation automatically');
+                    // Get current accumulated SOL to swap
+                    const gameDoc = await db.collection('games').doc(gameId).get();
+                    const gameData = gameDoc.exists ? gameDoc.data() : { totalSolCollected: 0 };
+                    const solToSwap = (gameData === null || gameData === void 0 ? void 0 : gameData.totalSolCollected) || config.entryFee;
+                    if (solToSwap > 0) {
+                        console.log(`💰 Found ${solToSwap} SOL to swap for BALL tokens`);
+                        // Perform Jupiter swap
+                        const swapResult = await performJupiterSwap(connection, treasuryWallet, solToSwap, config.tokenMint);
+                        if (swapResult.success) {
+                            const formattedAmount = formatTokenAmount(swapResult.outputAmount || '0');
+                            console.log(`🎉 Jupiter swap completed successfully!`);
+                            console.log(`💰 Swapped ${solToSwap} SOL for ${formattedAmount} BALL tokens (${swapResult.outputAmount} raw)`);
+                            console.log(`📝 Transaction: https://solscan.io/tx/${swapResult.signature}`);
+                            // Update game with swap details
+                            await db.collection('games').doc(gameId).update({
+                                jupiterSwap: {
+                                    signature: swapResult.signature,
+                                    inputAmount: swapResult.inputAmount,
+                                    outputAmount: swapResult.outputAmount,
+                                    priceImpact: swapResult.priceImpactPct,
+                                    timestamp: admin.firestore.FieldValue.serverTimestamp()
+                                },
+                                totalSolCollected: 0, // Reset after swap
+                                ballTokensAvailable: parseInt(swapResult.outputAmount || '0')
+                            });
+                            return {
+                                success: true,
+                                message: `Game started and ${solToSwap} SOL swapped for ${formattedAmount} BALL tokens`,
+                                swapSignature: swapResult.signature,
+                                ballTokensAvailable: parseInt(swapResult.outputAmount || '0'),
+                                ballTokensFormatted: formattedAmount,
+                                swapCompleted: true
+                            };
+                        }
+                        else {
+                            // Don't fail the entire game if swap fails, just log it
+                            console.log(`⚠️ Jupiter swap failed but game continues: ${swapResult.error}`);
+                            // Update game to show swap failed but game is active
+                            await db.collection('games').doc(gameId).update({
+                                swapFailed: {
+                                    error: swapResult.error,
+                                    details: swapResult.details,
+                                    timestamp: admin.firestore.FieldValue.serverTimestamp()
+                                },
+                                ballTokensAvailable: 0 // No tokens available since swap failed
+                            });
+                            return {
+                                success: true,
+                                message: `Game started but Jupiter swap failed: ${swapResult.error}`,
+                                swapFailed: true,
+                                swapCompleted: false,
+                                ballTokensAvailable: 0,
+                                details: swapResult.details
+                            };
+                        }
+                    }
+                    else {
+                        return {
+                            success: true,
+                            message: 'Game started but no new SOL to convert',
+                            swapCompleted: false,
+                            ballTokensAvailable: 0
+                        };
+                    }
+                }
+                catch (error) {
+                    console.error('❌ Error starting game:', error);
+                    return {
+                        success: false,
+                        error: (error === null || error === void 0 ? void 0 : error.message) || 'Failed to start game'
+                    };
+                }
+            case 'distributeTokens':
+                try {
+                    const { winnerAddress, amount } = params;
+                    if (!winnerAddress) {
+                        throw new Error('Winner address is required');
+                    }
+                    // If amount not provided, get from game data or use default
+                    let tokenAmount = amount;
+                    if (!tokenAmount) {
+                        const gameDoc = await db.collection('games').doc(gameId).get();
+                        const gameData = gameDoc.exists ? gameDoc.data() : {};
+                        tokenAmount = (gameData === null || gameData === void 0 ? void 0 : gameData.ballTokensAvailable) || 1000000; // Default 1M tokens
+                        const formattedDefault = formatTokenAmount(tokenAmount);
+                        console.log(`💰 Using default token amount: ${formattedDefault} BALL tokens (${tokenAmount} raw)`);
+                    }
+                    const result = await distributeTokens(connection, treasuryWallet, winnerAddress, config.tokenMint, tokenAmount);
+                    return result;
+                }
+                catch (error) {
+                    console.error('❌ Error distributing tokens:', error);
+                    return {
+                        success: false,
+                        error: (error === null || error === void 0 ? void 0 : error.message) || 'Failed to distribute tokens'
+                    };
+                }
+            default:
+                return {
+                    success: false,
+                    error: `Unknown action: ${action}`
+                };
+        }
+    }
+    catch (error) {
+        console.error('❌ Game function error:', error);
+        return {
+            success: false,
+            error: (error === null || error === void 0 ? void 0 : error.message) || 'Unknown error'
+        };
+    }
+});
+// Debug function to check configuration status
+exports.debugConfig = functions.https.onCall(async (data, context) => {
+    var _a;
+    try {
+        console.log('🔍 Debug: Checking configuration status...');
+        // Get config from Firestore
+        const configDoc = await db.collection('config').doc('game').get();
+        const configData = configDoc.exists ? configDoc.data() : null;
+        // Get BALL token info
+        const ballTokenDoc = await db.collection('tokenID').doc('BALL').get();
+        const ballTokenData = ballTokenDoc.exists ? ballTokenDoc.data() : null;
+        // Get treasury info
+        const treasuryDoc = await db.collection('config').doc('treasury').get();
+        const treasuryData = treasuryDoc.exists ? treasuryDoc.data() : null;
+        // Check Firebase Functions config
+        const hasPrivateKey = !!((_a = functions.config().treasury) === null || _a === void 0 ? void 0 : _a.pk);
+        const status = {
+            firebaseConfig: {
+                exists: configDoc.exists,
+                data: configData,
+                rpcUrl: (configData === null || configData === void 0 ? void 0 : configData.rpcUrl) || 'NOT SET',
+                tokenMint: (configData === null || configData === void 0 ? void 0 : configData.tokenMint) || 'NOT SET'
+            },
+            ballToken: {
+                exists: ballTokenDoc.exists,
+                data: ballTokenData,
+                mintAddress: (ballTokenData === null || ballTokenData === void 0 ? void 0 : ballTokenData.mintAddress) || 'NOT SET'
+            },
+            treasury: {
+                configExists: treasuryDoc.exists,
+                data: treasuryData,
+                hasPrivateKey: hasPrivateKey
+            },
+            recommendations: []
+        };
+        // Add recommendations
+        if (!(configData === null || configData === void 0 ? void 0 : configData.rpcUrl)) {
+            status.recommendations.push('Add rpcUrl to config/game document');
+        }
+        if (!(configData === null || configData === void 0 ? void 0 : configData.tokenMint) && !(ballTokenData === null || ballTokenData === void 0 ? void 0 : ballTokenData.mintAddress)) {
+            status.recommendations.push('Add tokenMint to config/game or mintAddress to tokenID/BALL');
+        }
+        if (!hasPrivateKey) {
+            status.recommendations.push('Configure treasury private key in Firebase Functions config');
+        }
+        return {
+            success: true,
+            status
+        };
+    }
+    catch (error) {
+        console.error('❌ Debug config error:', error);
+        return {
+            success: false,
+            error: (error === null || error === void 0 ? void 0 : error.message) || 'Unknown error'
+        };
     }
 });
 //# sourceMappingURL=index.js.map

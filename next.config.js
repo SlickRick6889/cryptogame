@@ -14,6 +14,7 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: false,
   },
+
   webpack: (config) => {
     config.resolve.fallback = {
       fs: false,
@@ -21,6 +22,7 @@ const nextConfig = {
       tls: false,
       crypto: false,
     };
+    config.externals.push('pino-pretty', 'lokijs', 'encoding');
     return config;
   },
 };
