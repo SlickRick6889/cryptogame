@@ -39,7 +39,7 @@ async function getBallMintAddress() {
         ? data.status.firebaseConfig.tokenMint 
         : data.status.ballToken.mintAddress !== 'NOT SET'
         ? data.status.ballToken.mintAddress
-        : 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y';
+        : process.env.BALL_TOKEN_MINT || 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y';
       
       console.log('\n🎯 ACTUAL BALL TOKEN MINT BEING USED:');
       console.log('   ' + actualMint);

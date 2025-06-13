@@ -73,17 +73,25 @@ async function getGameConfig() {
         throw new Error('Invalid treasury private key format: ' + error.message);
     }
 
+    // Validate required fields
+    const requiredFields = ['network', 'rpcUrl', 'prizeTokenMintAddress', 'entryFee', 'tokenSymbol'];
+    for (const field of requiredFields) {
+        if (!configData[field]) {
+            throw new Error(`Missing required config field: ${field}`);
+        }
+    }
+
     return {
-        network: configData.network || 'mainnet',
-        rpcUrl: configData.rpcUrl || 'https://api.mainnet-beta.solana.com',
+        network: configData.network,
+        rpcUrl: configData.rpcUrl,
         treasuryWallet: treasuryWallet,
-        ballTokenMint: configData.prizeTokenMintAddress || 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y',
-        entryFeeSol: configData.entryFee || 0.01,
+        ballTokenMint: configData.prizeTokenMintAddress,
+        entryFeeSol: configData.entryFee,
         maxPlayers: configData.maxPlayersPerGame || 5,
         npcInGame: configData.npcInGame ?? true,
         roundDurationSec: configData.roundDurationSec || 5,
         isProduction: configData.isProduction ?? false,
-        tokenSymbol: configData.tokenSymbol || 'BALL',
+        tokenSymbol: configData.tokenSymbol,
         prizeTokenDecimals: configData.prizeTokenDecimals || 9
     };
 }

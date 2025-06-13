@@ -5,7 +5,7 @@ const axios = require('axios');
 
 // Configuration
 const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-const BALL_TOKEN_MINT = 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'; // BALL token mint (correct)
+const BALL_TOKEN_MINT = process.env.BALL_TOKEN_MINT || 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'; // BALL token mint
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const JUPITER_API_URL = 'https://quote-api.jup.ag/v6';
 

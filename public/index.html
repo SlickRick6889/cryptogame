@@ -308,13 +308,8 @@
             hasActed: false
         };
 
-        // Game Configuration
-        let gameConfig = {
-            entryFee: 0.01,
-            maxPlayers: 5,
-            tokenSymbol: 'BALL',
-            prizeTokenMintAddress: 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'
-        };
+        // Game Configuration - loaded from Firestore
+        let gameConfig = null;
 
         // Load game configuration from Firestore
         async function loadGameConfig() {
@@ -322,26 +317,40 @@
                 const configDoc = await db.collection('config').doc('game').get();
                 if (configDoc.exists) {
                     const data = configDoc.data();
+                    
+                    // Validate required fields
+                    if (!data.entryFee || !data.maxPlayersPerGame || !data.tokenSymbol || 
+                        !data.prizeTokenMintAddress || !data.rpcUrl) {
+                        throw new Error('Missing required config fields in Firestore');
+                    }
+                    
                     gameConfig = {
-                        entryFee: data.entryFee || 0.01,
-                        maxPlayers: data.maxPlayersPerGame || 5,
-                        tokenSymbol: data.tokenSymbol || 'BALL',
-                        prizeTokenMintAddress: data.prizeTokenMintAddress || 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'
+                        entryFee: data.entryFee,
+                        maxPlayers: data.maxPlayersPerGame,
+                        tokenSymbol: data.tokenSymbol,
+                        prizeTokenMintAddress: data.prizeTokenMintAddress,
+                        rpcUrl: data.rpcUrl
                     };
-                    console.log('✅ Game config loaded:', gameConfig);
+                    console.log('✅ Game config loaded from Firestore:', gameConfig);
                     updateGameInfo();
                 } else {
-                    console.log('⚠️ No game config found, using defaults');
-                    updateGameInfo();
+                    throw new Error('Game configuration not found in Firestore');
                 }
             } catch (error) {
                 console.error('❌ Error loading game config:', error);
-                updateGameInfo();
+                showError('Failed to load game configuration: ' + error.message);
+                // Disable game functionality
+                document.querySelector('#wallet-section button').disabled = true;
+                document.querySelector('#wallet-section button').textContent = 'Config Error';
             }
         }
 
         // Update game info display
         function updateGameInfo() {
+            if (!gameConfig) {
+                console.log('⚠️ Game config not loaded yet');
+                return;
+            }
             document.getElementById('entry-fee').textContent = gameConfig.entryFee;
             document.getElementById('token-symbol').textContent = gameConfig.tokenSymbol;
             document.getElementById('token-symbol-2').textContent = gameConfig.tokenSymbol;
@@ -350,6 +359,10 @@
 
         // Get current SOL to token price and calculate prize
         async function updatePrizeAmount() {
+            if (!gameConfig) {
+                console.log('⚠️ Game config not loaded, skipping prize update');
+                return;
+            }
             try {
                 // Calculate total SOL prize pool based on actual SOL collected from real players
                 let totalSolPrize = gameConfig.entryFee; // Default to 1 entry fee for display
@@ -561,6 +574,9 @@
 
         // Send SOL Payment
         async function sendPayment(treasuryAddress, amount) {
+            if (!gameConfig) {
+                throw new Error('Game configuration not loaded');
+            }
             try {
                 const phantom = window.solana;
                 if (!phantom || !phantom.isConnected) {
@@ -571,7 +587,7 @@
 
                 // Create transaction
                 const { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = window.solanaWeb3;
-                const connection = new Connection('https://api.mainnet-beta.solana.com');
+                const connection = new Connection(gameConfig.rpcUrl, 'confirmed');
                 
                 const fromPubkey = new PublicKey(gameState.wallet);
                 const toPubkey = new PublicKey(treasuryAddress);
