@@ -38,6 +38,7 @@ module.exports = {
         'glow': 'glow 2s ease-in-out infinite alternate',
         'float': 'float 3s ease-in-out infinite',
         'pulse-fast': 'pulse 1s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+        'blob': 'blob 7s infinite',
       },
       keyframes: {
         glow: {
@@ -48,6 +49,20 @@ module.exports = {
           '0%, 100%': { transform: 'translateY(0px)' },
           '50%': { transform: 'translateY(-10px)' },
         },
+        blob: {
+          '0%': {
+            transform: 'translate(0px, 0px) scale(1)',
+          },
+          '33%': {
+            transform: 'translate(30px, -50px) scale(1.1)',
+          },
+          '66%': {
+            transform: 'translate(-20px, 20px) scale(0.9)',
+          },
+          '100%': {
+            transform: 'translate(0px, 0px) scale(1)',
+          },
+        }
       },
       fontFamily: {
         'gaming': ['Orbitron', 'monospace'],
@@ -56,6 +71,10 @@ module.exports = {
       backdropBlur: {
         xs: '2px',
       },
+      animationDelay: {
+        '2000': '2s',
+        '4000': '4s',
+      }
     },
   },
   plugins: [],

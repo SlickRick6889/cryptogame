@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎮 CRYPTO ELIMINATION 🎮</title>
+    <!-- Cache buster: v1.1 -->
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(45deg, #000, #1a0033, #330066, #000);
+            background-size: 400% 400%;
+            animation: psychedelicBg 8s ease-in-out infinite;
+            color: white;
+            font-family: 'Courier New', monospace;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        @keyframes psychedelicBg {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            position: relative;
+            z-index: 10;
+        }
+
+        .game-card {
+            background: rgba(0, 0, 0, 0.8);
+            border: 2px solid #ff00ff;
+            border-radius: 20px;
+            padding: 30px;
+            text-align: center;
+            box-shadow: 0 0 50px rgba(255, 0, 255, 0.3);
+            backdrop-filter: blur(10px);
+        }
+
+        .title {
+            font-size: 2.5rem;
+            margin-bottom: 20px;
+            text-shadow: 0 0 20px #00ffff;
+            animation: glitch 2s infinite;
+        }
+
+        @keyframes glitch {
+            0%, 100% { text-shadow: 0 0 20px #00ffff; }
+            25% { text-shadow: -2px 0 #ff0000, 2px 0 #00ffff; }
+            50% { text-shadow: 2px 0 #ff0000, -2px 0 #00ffff; }
+            75% { text-shadow: 0 0 20px #ff00ff; }
+        }
+
+        .status {
+            font-size: 1.5rem;
+            margin: 20px 0;
+            color: #00ffff;
+        }
+
+        .timer {
+            font-size: 3rem;
+            margin: 20px 0;
+            color: #ff0000;
+            text-shadow: 0 0 30px #ff0000;
+        }
+
+        .players {
+            font-size: 1.2rem;
+            margin: 20px 0;
+            color: #00ff00;
+        }
+
+        .action-btn {
+            background: linear-gradient(45deg, #ff00ff, #00ffff);
+            border: none;
+            padding: 15px 30px;
+            font-size: 1.5rem;
+            color: white;
+            border-radius: 10px;
+            cursor: pointer;
+            margin: 20px;
+            transition: all 0.3s;
+            text-shadow: 0 0 10px rgba(0, 0, 0, 0.8);
+        }
+
+        .action-btn:hover {
+            transform: scale(1.1);
+            box-shadow: 0 0 30px rgba(255, 0, 255, 0.8);
+        }
+
+        .action-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .wallet-btn {
+            background: linear-gradient(45deg, #9945ff, #14f195);
+            border: 2px solid transparent;
+            padding: 20px 40px;
+            font-size: 1.4rem;
+            color: white;
+            border-radius: 15px;
+            cursor: pointer;
+            margin: 20px 0;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            font-weight: bold;
+            letter-spacing: 1px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 0 20px rgba(153, 69, 255, 0.4);
+        }
+
+        .wallet-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 40px rgba(153, 69, 255, 0.8), 0 0 80px rgba(20, 241, 149, 0.4);
+            border-color: #14f195;
+        }
+
+        .wallet-btn:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .wallet-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .wallet-btn:hover::before {
+            left: 100%;
+        }
+
+        .floating-orbs {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .orb {
+            position: absolute;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(255, 0, 255, 0.3), transparent);
+            animation: float 6s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) rotate(0deg); }
+            50% { transform: translateY(-20px) rotate(180deg); }
+        }
+
+        .winner-screen {
+            background: linear-gradient(45deg, #ff0000, #ffff00, #00ff00, #00ffff, #ff00ff);
+            background-size: 400% 400%;
+            animation: rainbow 2s linear infinite;
+            padding: 40px;
+            border-radius: 20px;
+            margin: 20px 0;
+        }
+
+        @keyframes rainbow {
+            0% { background-position: 0% 50%; }
+            100% { background-position: 100% 50%; }
+        }
+
+        .hidden { display: none; }
+        .error { color: #ff0000; margin: 10px 0; }
+        .success { color: #00ff00; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="floating-orbs" id="orbs"></div>
+    
+    <div class="container">
+        <div class="game-card">
+            <h1 class="title">🎮 CRYPTO ELIMINATION 🎮</h1>
+            
+            <!-- Wallet Connection -->
+            <div id="wallet-section">
+                <div style="margin-bottom: 20px; color: #00ffff;">
+                    <p>🚀 Connect your Phantom wallet to start playing!</p>
+                    <p style="font-size: 0.9rem; color: #aaa; margin-top: 10px;">
+                        Need Phantom? <a href="https://phantom.app/" target="_blank" style="color: #14f195;">Download here</a>
+                    </p>
+                </div>
+                <button class="wallet-btn" onclick="connectWallet()">
+                    👻 Connect Phantom Wallet
+                </button>
+                <div id="wallet-status"></div>
+            </div>
+
+            <!-- Game Lobby -->
+            <div id="lobby-section" class="hidden">
+                <div class="status">Ready to Play?</div>
+                <div id="game-info" style="margin: 15px 0; color: #ffff00;">
+                    💰 Entry Fee: <span id="entry-fee">Loading...</span> SOL per player<br>
+                    🏆 Prize: ~<span id="prize-amount">Loading...</span> $<span id="token-symbol">BALL</span> tokens<br>
+                    <small style="color: #aaa;">SOL collected, swapped to <span id="token-symbol-2">BALL</span> tokens for winner</small>
+                </div>
+                <button class="action-btn" onclick="joinGame()">🎯 JOIN GAME</button>
+            </div>
+
+            <!-- Game In Progress -->
+            <div id="game-section" class="hidden">
+                <div class="status" id="game-status">ELIMINATION ROUND 1</div>
+                <div class="timer" id="timer">5</div>
+                <div class="players" id="players-info">5 PLAYERS LEFT</div>
+                <button class="action-btn" id="action-btn" onclick="playerAction()">🎯 CLICK TO SURVIVE!</button>
+                <div id="action-status"></div>
+            </div>
+
+            <!-- Winner Screen -->
+            <div id="winner-section" class="hidden">
+                <div class="winner-screen">
+                    <h2 id="winner-text">🎉 YOU WON! 🎉</h2>
+                    <div id="prize-info"></div>
+                    <button class="action-btn" onclick="playAgain()">🎮 PLAY AGAIN</button>
+                    <button class="action-btn" onclick="disconnectWallet()">🚪 DISCONNECT</button>
+                </div>
+            </div>
+
+            <div id="error-message" class="error"></div>
+        </div>
+    </div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.0.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.0.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.0.0/firebase-functions-compat.js"></script>
+    <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+
+    <!-- Solana Wallet Adapter -->
+    <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+    
+    <!-- Wait for Phantom wallet to load -->
+    <script>
+        // Wait for Phantom wallet to be available
+        function waitForPhantom() {
+            return new Promise((resolve) => {
+                if (window.solana && window.solana.isPhantom) {
+                    resolve(window.solana);
+                } else {
+                    const interval = setInterval(() => {
+                        if (window.solana && window.solana.isPhantom) {
+                            clearInterval(interval);
+                            resolve(window.solana);
+                        }
+                    }, 100);
+                    
+                    // Timeout after 5 seconds
+                    setTimeout(() => {
+                        clearInterval(interval);
+                        resolve(null);
+                    }, 5000);
+                }
+            });
+        }
+    </script>
+
+    <script>
+        // Firebase Configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyBOqKhJZKvQQQQQQQQQQQQQQQQQQQQQQQQ",
+            authDomain: "website-6889.firebaseapp.com",
+            projectId: "website-6889",
+            storageBucket: "website-6889.appspot.com",
+            messagingSenderId: "606064079207",
+            appId: "1:606064079207:web:abcdefghijklmnop"
+        };
+
+        // Initialize Firebase
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+        const functions = firebase.functions();
+        
+        // Always use deployed functions
+        console.log('🚀 Using deployed Firebase Functions');
+
+        // Game State
+        let gameState = {
+            connected: false,
+            wallet: null,
+            gameId: null,
+            status: 'lobby',
+            players: {},
+            round: 0,
+            timer: 5,
+            hasActed: false
+        };
+
+        // Game Configuration
+        let gameConfig = {
+            entryFee: 0.01,
+            maxPlayers: 5,
+            tokenSymbol: 'BALL',
+            prizeTokenMintAddress: 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'
+        };
+
+        // Load game configuration from Firestore
+        async function loadGameConfig() {
+            try {
+                const configDoc = await db.collection('config').doc('game').get();
+                if (configDoc.exists) {
+                    const data = configDoc.data();
+                    gameConfig = {
+                        entryFee: data.entryFee || 0.01,
+                        maxPlayers: data.maxPlayersPerGame || 5,
+                        tokenSymbol: data.tokenSymbol || 'BALL',
+                        prizeTokenMintAddress: data.prizeTokenMintAddress || 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'
+                    };
+                    console.log('✅ Game config loaded:', gameConfig);
+                    updateGameInfo();
+                } else {
+                    console.log('⚠️ No game config found, using defaults');
+                    updateGameInfo();
+                }
+            } catch (error) {
+                console.error('❌ Error loading game config:', error);
+                updateGameInfo();
+            }
+        }
+
+        // Update game info display
+        function updateGameInfo() {
+            document.getElementById('entry-fee').textContent = gameConfig.entryFee;
+            document.getElementById('token-symbol').textContent = gameConfig.tokenSymbol;
+            document.getElementById('token-symbol-2').textContent = gameConfig.tokenSymbol;
+            updatePrizeAmount();
+        }
+
+        // Get current SOL to token price and calculate prize
+        async function updatePrizeAmount() {
+            try {
+                // Calculate total SOL prize pool based on actual SOL collected from real players
+                let totalSolPrize = gameConfig.entryFee; // Default to 1 entry fee for display
+                let realPlayersCount = 1;
+                
+                // If we have game data, calculate based on actual payments
+                if (gameState.players && Object.keys(gameState.players).length > 0) {
+                    const realPlayers = Object.values(gameState.players).filter(p => !p.isNpc && p.solPaid > 0);
+                    realPlayersCount = realPlayers.length;
+                    totalSolPrize = realPlayers.reduce((sum, player) => sum + (player.solPaid || 0), 0);
+                    
+                    // If no real players found but we have a gameId, assume 1 real player (us)
+                    if (realPlayersCount === 0 && gameState.gameId) {
+                        realPlayersCount = 1;
+                        totalSolPrize = gameConfig.entryFee;
+                    }
+                }
+                
+                // Get current SOL price from Jupiter API
+                let solPriceUSD = 144; // fallback
+                try {
+                    const solResponse = await fetch('https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112');
+                    const solData = await solResponse.json();
+                    if (solData.data && solData.data['So11111111111111111111111111111111111111112']) {
+                        solPriceUSD = parseFloat(solData.data['So11111111111111111111111111111111111111112'].price);
+                        console.log(`📊 SOL price: $${solPriceUSD}`);
+                    }
+                } catch (error) {
+                    console.log('Using fallback SOL price: $144');
+                }
+                
+                // Calculate USD value of prize
+                const prizeUSD = totalSolPrize * solPriceUSD;
+                
+                // Get token price (if available) or estimate
+                let tokenAmount = 'TBD';
+                try {
+                    // Try to get token price from Jupiter API
+                    const jupiterResponse = await fetch(`https://api.jup.ag/price/v2?ids=${gameConfig.prizeTokenMintAddress}`);
+                    const jupiterData = await jupiterResponse.json();
+                    
+                    if (jupiterData.data && jupiterData.data[gameConfig.prizeTokenMintAddress]) {
+                        const spotTokenPriceUSD = parseFloat(jupiterData.data[gameConfig.prizeTokenMintAddress].price);
+                        
+                        // Apply slippage adjustment based on actual game results
+                        // Spot price gives ~973 tokens, but actual swap gives 921 tokens
+                        // This suggests ~5.6% slippage/fees: 921/973 = 0.9465
+                        const slippageAdjustment = 0.9465;
+                        const adjustedTokenPrice = spotTokenPriceUSD / slippageAdjustment;
+                        
+                        tokenAmount = Math.floor(prizeUSD / adjustedTokenPrice).toLocaleString();
+                        console.log(`🪙 ${gameConfig.tokenSymbol} spot: $${spotTokenPriceUSD}, adjusted: $${adjustedTokenPrice.toFixed(8)} → ${tokenAmount} tokens`);
+                    } else {
+                        // Fallback based on actual game results: 0.01 SOL → 921 BALL
+                        // At $144 SOL: $1.44 → 921 BALL = $0.001564 per BALL
+                        const actualTokenPrice = 0.001564;
+                        tokenAmount = Math.floor(prizeUSD / actualTokenPrice).toLocaleString();
+                        console.log(`📊 Using actual game result: $${actualTokenPrice} per ${gameConfig.tokenSymbol} → ${tokenAmount} tokens`);
+                    }
+                } catch (error) {
+                    // Fallback based on actual game results
+                    const actualTokenPrice = 0.001564;
+                    tokenAmount = Math.floor(prizeUSD / actualTokenPrice).toLocaleString();
+                    console.log(`📊 API failed, using actual game result: $${actualTokenPrice} per ${gameConfig.tokenSymbol} → ${tokenAmount} tokens`);
+                }
+                
+                document.getElementById('prize-amount').textContent = tokenAmount;
+                const totalPlayers = Object.keys(gameState.players || {}).length;
+                console.log(`💰 Prize updated: ${totalSolPrize} SOL (${realPlayersCount} real players, ${totalPlayers} total) (~$${prizeUSD.toFixed(2)}) → ~${tokenAmount} ${gameConfig.tokenSymbol}`);
+                
+            } catch (error) {
+                console.error('❌ Error updating prize amount:', error);
+                document.getElementById('prize-amount').textContent = 'TBD';
+            }
+        }
+
+        // Update prize every 5 seconds
+        setInterval(updatePrizeAmount, 5000);
+
+        // Show/Hide sections
+        function showSection(sectionId) {
+            const sections = ['wallet-section', 'lobby-section', 'game-section', 'winner-section'];
+            sections.forEach(id => {
+                const element = document.getElementById(id);
+                if (element) {
+                    element.classList.toggle('hidden', id !== sectionId);
+                }
+            });
+        }
+
+        // Show error message
+        function showError(message) {
+            document.getElementById('error-message').textContent = message;
+        }
+
+        // Create floating orbs
+        function createOrbs() {
+            const orbsContainer = document.getElementById('orbs');
+            for (let i = 0; i < 20; i++) {
+                const orb = document.createElement('div');
+                orb.className = 'orb';
+                orb.style.width = Math.random() * 100 + 50 + 'px';
+                orb.style.height = orb.style.width;
+                orb.style.left = Math.random() * 100 + '%';
+                orb.style.top = Math.random() * 100 + '%';
+                orb.style.animationDelay = Math.random() * 6 + 's';
+                orbsContainer.appendChild(orb);
+            }
+        }
+
+        // Connect Phantom Wallet
+        async function connectWallet() {
+            try {
+                showError('');
+                document.querySelector('#wallet-section button').innerHTML = '⚡ CONNECTING...';
+                document.querySelector('#wallet-section button').disabled = true;
+                
+                // Wait for Phantom to be available
+                const phantom = await waitForPhantom();
+                
+                if (!phantom) {
+                    throw new Error('Phantom wallet not found! Please install Phantom wallet extension.');
+                }
+
+                console.log('🔗 Phantom wallet found, attempting connection...');
+                const response = await phantom.connect();
+                
+                gameState.connected = true;
+                gameState.wallet = response.publicKey.toString();
+                
+                console.log('✅ Wallet connected:', gameState.wallet);
+                
+                document.getElementById('wallet-status').innerHTML = 
+                    `<div class="success">✅ Connected: ${gameState.wallet.slice(0, 8)}...</div>`;
+                
+                showSection('lobby-section');
+                
+            } catch (error) {
+                console.error('Wallet connection error:', error);
+                showError('Failed to connect wallet: ' + error.message);
+                document.querySelector('#wallet-section button').innerHTML = '👻 Connect Phantom Wallet';
+                document.querySelector('#wallet-section button').disabled = false;
+            }
+        }
+
+        // Join Game
+        async function joinGame() {
+            try {
+                if (!gameState.connected || !gameState.wallet) {
+                    showError('Please connect your wallet first!');
+                    return;
+                }
+                
+                showError('');
+                document.querySelector('#lobby-section button').textContent = '⚡ JOINING...';
+                document.querySelector('#lobby-section button').disabled = true;
+                
+                console.log('🎮 Attempting to join game with wallet:', gameState.wallet);
+                
+                const joinLobby = functions.httpsCallable('joinLobby');
+                const result = await joinLobby({ playerAddress: gameState.wallet });
+                
+                console.log('✅ Join game result:', result.data);
+                
+                // Check if payment is required
+                if (result.data.requiresPayment) {
+                    console.log('💰 Payment required, processing SOL transfer...');
+                    document.querySelector('#lobby-section button').textContent = '💰 PROCESSING PAYMENT...';
+                    
+                    // Send SOL payment
+                    const success = await sendPayment(result.data.treasuryAddress, result.data.entryFee);
+                    
+                    if (!success) {
+                        document.querySelector('#lobby-section button').textContent = '🎯 JOIN GAME';
+                        document.querySelector('#lobby-section button').disabled = false;
+                        return;
+                    }
+                    
+                    // Retry joining after payment with transaction signature
+                    console.log('💰 Payment sent, retrying join with signature...');
+                    document.querySelector('#lobby-section button').textContent = '⚡ VERIFYING PAYMENT...';
+                    
+                    const retryResult = await joinLobby({ 
+                        playerAddress: gameState.wallet,
+                        transactionSignature: success // success contains the transaction signature
+                    });
+                    console.log('✅ Retry join result:', retryResult.data);
+                    
+                    if (!retryResult.data.success) {
+                        throw new Error(retryResult.data.message || 'Failed to join after payment');
+                    }
+                    
+                    gameState.gameId = retryResult.data.gameId;
+                } else if (result.data.success) {
+                    gameState.gameId = result.data.gameId;
+                } else {
+                    throw new Error(result.data.message || 'Failed to join game');
+                }
+                
+                startGameListener();
+                
+            } catch (error) {
+                console.error('❌ Join game error:', error);
+                showError('Failed to join game: ' + error.message);
+                document.querySelector('#lobby-section button').textContent = '🎯 JOIN GAME';
+                document.querySelector('#lobby-section button').disabled = false;
+            }
+        }
+
+        // Send SOL Payment
+        async function sendPayment(treasuryAddress, amount) {
+            try {
+                const phantom = window.solana;
+                if (!phantom || !phantom.isConnected) {
+                    throw new Error('Phantom wallet not connected');
+                }
+
+                console.log(`💰 Sending ${amount} SOL to ${treasuryAddress}`);
+
+                // Create transaction
+                const { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } = window.solanaWeb3;
+                const connection = new Connection('https://api.mainnet-beta.solana.com');
+                
+                const fromPubkey = new PublicKey(gameState.wallet);
+                const toPubkey = new PublicKey(treasuryAddress);
+                const lamports = Math.floor(amount * LAMPORTS_PER_SOL);
+
+                const transaction = new Transaction().add(
+                    SystemProgram.transfer({
+                        fromPubkey,
+                        toPubkey,
+                        lamports,
+                    })
+                );
+
+                // Get recent blockhash
+                const { blockhash } = await connection.getLatestBlockhash();
+                transaction.recentBlockhash = blockhash;
+                transaction.feePayer = fromPubkey;
+
+                // Sign and send transaction
+                const signedTransaction = await phantom.signTransaction(transaction);
+                const signature = await connection.sendRawTransaction(signedTransaction.serialize());
+                
+                console.log('💰 Transaction sent:', signature);
+                
+                // Wait for confirmation
+                await connection.confirmTransaction(signature, 'confirmed');
+                console.log('✅ Payment confirmed:', signature);
+                
+                return signature;
+                
+            } catch (error) {
+                console.error('❌ Payment error:', error);
+                showError('Payment failed: ' + error.message);
+                return false;
+            }
+        }
+
+        // Listen to game updates
+        function startGameListener() {
+            if (!gameState.gameId) return;
+
+            db.collection('games').doc(gameState.gameId).onSnapshot((doc) => {
+                if (doc.exists) {
+                    const data = doc.data();
+                    gameState.status = data.status;
+                    gameState.players = data.players || {};
+                    gameState.round = data.round || 0;
+
+                    // Update prize when players change
+                    updatePrizeAmount();
+
+                    if (data.status === 'in_progress') {
+                        showSection('game-section');
+                        updateGameUI(data);
+                        startTimer(data.roundStartedAt);
+                    } else if (data.status === 'completed') {
+                        showWinner(data.winner, data);
+                    }
+                }
+            });
+        }
+
+        // Update Game UI
+        function updateGameUI(data) {
+            const alivePlayers = Object.values(data.players).filter(p => p.status === 'alive');
+            const self = data.players[gameState.wallet];
+            
+            document.getElementById('game-status').textContent = `⚡ ELIMINATION ROUND ${data.round} ⚡`;
+            document.getElementById('players-info').textContent = `${alivePlayers.length} PLAYERS LEFT`;
+            
+            // Check if player has acted this round
+            gameState.hasActed = self && self.lastActionRound === data.round;
+            
+            const actionBtn = document.getElementById('action-btn');
+            const actionStatus = document.getElementById('action-status');
+            
+            if (gameState.hasActed) {
+                actionBtn.textContent = '✅ SURVIVED THIS ROUND!';
+                actionBtn.disabled = true;
+                actionStatus.innerHTML = '<div class="success">Action recorded! Wait for round to end...</div>';
+            } else {
+                actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
+                actionBtn.disabled = false;
+                actionStatus.innerHTML = '';
+            }
+        }
+
+        // Start Round Timer
+        function startTimer(roundStartedAt) {
+            const startTime = roundStartedAt.toMillis();
+            const roundDuration = 5000; // 5 seconds
+            
+            const timerInterval = setInterval(() => {
+                const now = Date.now();
+                const elapsed = now - startTime;
+                const remaining = Math.max(0, Math.ceil((roundDuration - elapsed) / 1000));
+                
+                document.getElementById('timer').textContent = remaining;
+                
+                if (remaining <= 0) {
+                    clearInterval(timerInterval);
+                    document.getElementById('timer').textContent = "TIME'S UP!";
+                    
+                    // Trigger game tick to process round immediately
+                    setTimeout(() => {
+                        triggerGameTick();
+                    }, 100);
+                }
+            }, 100);
+        }
+
+        // Trigger Game Tick
+        async function triggerGameTick() {
+            try {
+                console.log('⚡ Triggering game tick to process round...');
+                const fastGameTick = functions.httpsCallable('fastGameTick');
+                await fastGameTick({});
+                console.log('✅ Game tick completed');
+            } catch (error) {
+                console.error('❌ Game tick error:', error);
+            }
+        }
+
+        // Player Action
+        async function playerAction() {
+            try {
+                if (gameState.hasActed) return;
+                
+                // Immediate visual feedback
+                const actionBtn = document.getElementById('action-btn');
+                const actionStatus = document.getElementById('action-status');
+                
+                actionBtn.disabled = true;
+                actionBtn.textContent = '⚡ PROCESSING...';
+                actionStatus.innerHTML = '<div class="success">🎯 Action sent! Processing...</div>';
+                
+                // Set local state immediately for responsiveness
+                gameState.hasActed = true;
+                
+                console.log('🎯 Sending player action immediately...');
+                
+                // Send action to backend
+                const playerActionFunc = functions.httpsCallable('playerAction');
+                const result = await playerActionFunc({
+                    gameId: gameState.gameId,
+                    playerAddress: gameState.wallet
+                });
+                
+                console.log('✅ Player action confirmed by backend');
+                
+                // Update UI with success
+                actionBtn.textContent = '✅ SURVIVED THIS ROUND!';
+                actionStatus.innerHTML = '<div class="success">✅ Action recorded! Wait for round to end...</div>';
+                
+            } catch (error) {
+                console.error('❌ Player action failed:', error);
+                
+                // Reset state on error
+                gameState.hasActed = false;
+                
+                showError('Action failed: ' + error.message);
+                const actionBtn = document.getElementById('action-btn');
+                const actionStatus = document.getElementById('action-status');
+                
+                actionBtn.disabled = false;
+                actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
+                actionStatus.innerHTML = '<div class="error">❌ Action failed! Try again!</div>';
+            }
+        }
+
+        // Show Winner
+        function showWinner(winner, gameData) {
+            showSection('winner-section');
+            const winnerText = document.getElementById('winner-text');
+            const prizeInfo = document.getElementById('prize-info');
+            
+            if (winner === gameState.wallet) {
+                winnerText.textContent = '🎉 YOU WON! 🎉';
+                if (gameData.prize) {
+                    prizeInfo.innerHTML = `
+                        <div style="font-size: 1.5rem; margin: 10px 0;">
+                            🏀 Prize: ${gameData.prize.prizeAmountFormatted} $${gameData.prize.tokenSymbol}
+                        </div>
+                        <div style="font-size: 0.9rem; color: #aaa; margin: 5px 0;">
+                            (${gameData.prize.solCollected} SOL collected & swapped)
+                        </div>
+                        <div>Congratulations! You survived all rounds!</div>
+                    `;
+                } else {
+                    prizeInfo.textContent = 'Congratulations! You survived all rounds!';
+                }
+            } else {
+                winnerText.textContent = '💀 GAME OVER 💀';
+                prizeInfo.innerHTML = `
+                    <div>Winner: ${winner ? winner.slice(0, 8) + '...' : 'No one'}</div>
+                    <div style="margin-top: 10px;">Better luck next time!</div>
+                `;
+            }
+        }
+
+        // Play Again
+        function playAgain() {
+            // Reset all game state
+            gameState.gameId = null;
+            gameState.hasActed = false;
+            gameState.status = null;
+            gameState.players = {};
+            gameState.round = 0;
+            
+            // Reset UI elements
+            showError('');
+            document.querySelector('#lobby-section button').textContent = '⚡ JOIN GAME';
+            document.querySelector('#lobby-section button').disabled = false;
+            
+            // Show lobby section
+            showSection('lobby-section');
+            console.log('🔄 Game state reset for new game');
+        }
+
+        // Disconnect Wallet
+        async function disconnectWallet() {
+            try {
+                if (window.solana && window.solana.isConnected) {
+                    await window.solana.disconnect();
+                }
+                gameState.connected = false;
+                gameState.wallet = null;
+                gameState.gameId = null;
+                showSection('wallet-section');
+                document.getElementById('wallet-status').innerHTML = '';
+                document.querySelector('#wallet-section button').innerHTML = '👻 Connect Phantom Wallet';
+                document.querySelector('#wallet-section button').disabled = false;
+                console.log('🔌 Wallet disconnected');
+            } catch (error) {
+                console.error('Disconnect error:', error);
+                showError('Failed to disconnect: ' + error.message);
+            }
+        }
+
+        // Utility Functions
+        function showSection(sectionId) {
+            const sections = ['wallet-section', 'lobby-section', 'game-section', 'winner-section'];
+            sections.forEach(id => {
+                document.getElementById(id).classList.add('hidden');
+            });
+            document.getElementById(sectionId).classList.remove('hidden');
+        }
+
+        function showError(message) {
+            document.getElementById('error-message').textContent = message;
+        }
+
+        // Initialize
+        createOrbs();
+        
+        // Check if wallet is already connected on page load
+        window.addEventListener('load', async () => {
+            // Load game configuration first
+            await loadGameConfig();
+            
+            try {
+                const phantom = await waitForPhantom();
+                if (phantom && phantom.isConnected) {
+                    gameState.connected = true;
+                    gameState.wallet = phantom.publicKey.toString();
+                    document.getElementById('wallet-status').innerHTML = 
+                        `<div class="success">✅ Connected: ${gameState.wallet.slice(0, 8)}...</div>`;
+                    showSection('lobby-section');
+                    console.log('🔗 Wallet already connected:', gameState.wallet);
+                }
+            } catch (error) {
+                console.log('No wallet connected on load');
+            }
+        });
+    </script>
+</body>
+</html> 

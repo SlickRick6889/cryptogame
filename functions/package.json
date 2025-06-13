@@ -1,29 +1,21 @@
 {
-  "name": "staypool-functions",
-  "version": "1.0.1",
-  "description": "STAYPOOL automated wallet functions",
-  "main": "lib/index.js",
+  "name": "crypto-elimination-functions",
+  "version": "1.0.0",
+  "description": "Simple crypto elimination game functions",
+  "main": "index.js",
   "scripts": {
-    "build": "tsc",
-    "serve": "npm run build && firebase emulators:start --only functions",
-    "shell": "npm run build && firebase functions:shell",
-    "start": "npm run shell",
-    "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log"
-  },
-  "engines": {
-    "node": "18"
+    "build": "echo 'No build needed for simple JS'",
+    "deploy": "firebase deploy --only functions"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.13",
-    "@solana/web3.js": "^1.87.6",
+    "@solana/web3.js": "^1.98.2",
     "axios": "^1.9.0",
-    "bs58": "^5.0.0",
-    "firebase-admin": "^12.0.0",
-    "firebase-functions": "^4.5.0"
+    "bs58": "^6.0.0",
+    "firebase-admin": "^11.0.0",
+    "firebase-functions": "^4.0.0"
   },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+  "engines": {
+    "node": "18"
   }
 }

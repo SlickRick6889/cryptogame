@@ -4,7 +4,7 @@ const bs58 = require('bs58');
 const axios = require('axios');
 
 // Configuration
-const RPC_URL = 'https://mainnet.helius-rpc.com/?api-key=f10bbc12-c465-44a6-8064-ff3113d3c389';
+const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const BALL_TOKEN_MINT = 'BALLrveijbhu42QaS2XW1pRBYfMji73bGeYJghUvQs6y'; // BALL token mint (correct)
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const JUPITER_API_URL = 'https://quote-api.jup.ag/v6';
