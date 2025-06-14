@@ -814,15 +814,20 @@ async function processGameRounds() {
                                 // Transfer tokens to winner
                                 const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
                                 
+                                // Jupiter returns the actual token amount (not in smallest units)
+                                const actualTokenAmount = parseInt(swapResult.outputAmount);
+                                const formattedAmount = (actualTokenAmount / Math.pow(10, config.prizeTokenDecimals)).toFixed(2);
+                                
                                 prizeData = {
-                                    prizeAmountFormatted: (parseInt(swapResult.outputAmount) / Math.pow(10, config.prizeTokenDecimals)).toLocaleString(),
+                                    prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
                                     tokenSymbol: config.tokenSymbol,
-                                    rawAmount: parseInt(swapResult.outputAmount),
+                                    rawAmount: actualTokenAmount,
                                     solCollected: game.totalSolCollected,
                                     swapSignature: swapResult.signature,
                                     transferSignature: transferResult.signature || null,
                                     swapSuccess: true,
-                                    transferSuccess: transferResult.success || false
+                                    transferSuccess: transferResult.success || false,
+                                    jupiterQuoteAmount: swapResult.outputAmount // Store original for debugging
                                 };
                                 
                                 if (!transferResult.success) {
