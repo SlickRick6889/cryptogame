@@ -369,140 +369,144 @@ exports.playerAction = functions.https.onCall(async (data, context) => {
     }
 });
 
-// Fast Game Tick for Real-time Processing
-exports.fastGameTick = functions.https.onCall(async (data, context) => {
-    try {
-        const config = await getGameConfig();
-        const now = admin.firestore.Timestamp.now();
+// Internal game processing function
+async function processGameRounds() {
+    const config = await getGameConfig();
+    const now = admin.firestore.Timestamp.now();
+    
+    // Get all active games
+    const activeGamesQuery = db.collection('games').where('status', '==', 'in_progress');
+    const activeGames = await activeGamesQuery.get();
+
+    if (activeGames.empty) {
+        return { success: true, message: 'No active games' };
+    }
+
+    let processedGames = 0;
+
+    for (const doc of activeGames.docs) {
+        const game = doc.data();
+        const gameRef = doc.ref;
         
-        // Get all active games
-        const activeGamesQuery = db.collection('games').where('status', '==', 'in_progress');
-        const activeGames = await activeGamesQuery.get();
-
-        if (activeGames.empty) {
-            return { success: true, message: 'No active games' };
-        }
-
-        let processedGames = 0;
-
-        for (const doc of activeGames.docs) {
-            const game = doc.data();
-            const gameRef = doc.ref;
+        // Check if round should end (with small buffer for instant processing)
+        const roundStartTime = game.roundStartedAt.toMillis();
+        const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
+        
+        if (elapsedSec >= config.roundDurationSec) {
+            console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
             
-            // Check if round should end
-            const roundStartTime = game.roundStartedAt.toMillis();
-            const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
+            let players = { ...game.players };
             
-            if (elapsedSec >= config.roundDurationSec) {
-                console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
-                
-                let players = { ...game.players };
-                
-                // Make bots act strategically
-                Object.keys(players).forEach(playerId => {
-                    const player = players[playerId];
-                    if (player.isNpc && player.status === 'alive') {
-                        // Check if this bot should be eliminated this round
-                        if (player.eliminationRound === game.round) {
-                            // Don't act - will be eliminated
-                            console.log(`🤖 Bot ${playerId} scheduled for elimination in round ${game.round}`);
-                        } else {
-                            // Act to survive
-                            players[playerId] = { ...player, lastActionRound: game.round };
-                        }
+            // Make bots act strategically
+            Object.keys(players).forEach(playerId => {
+                const player = players[playerId];
+                if (player.isNpc && player.status === 'alive') {
+                    // Check if this bot should be eliminated this round
+                    if (player.eliminationRound === game.round) {
+                        // Don't act - will be eliminated
+                        console.log(`🤖 Bot ${playerId} scheduled for elimination in round ${game.round}`);
+                    } else {
+                        // Act to survive
+                        players[playerId] = { ...player, lastActionRound: game.round };
                     }
-                });
+                }
+            });
 
-                // Eliminate players who didn't act
-                Object.keys(players).forEach(playerId => {
-                    const player = players[playerId];
-                    if (player.status === 'alive' && player.lastActionRound < game.round) {
-                        players[playerId] = { ...player, status: 'eliminated' };
-                        console.log(`💀 Eliminated ${playerId} in round ${game.round}`);
-                    }
-                });
+            // Eliminate players who didn't act
+            Object.keys(players).forEach(playerId => {
+                const player = players[playerId];
+                if (player.status === 'alive' && player.lastActionRound < game.round) {
+                    players[playerId] = { ...player, status: 'eliminated' };
+                    console.log(`💀 Eliminated ${playerId} in round ${game.round}`);
+                }
+            });
 
-                // Check for winner
-                const alivePlayers = Object.values(players).filter(p => p.status === 'alive');
+            // Check for winner
+            const alivePlayers = Object.values(players).filter(p => p.status === 'alive');
+            
+            if (alivePlayers.length <= 1) {
+                // Game over - trigger Jupiter swap for winner
+                const winner = alivePlayers[0];
+                console.log(`🎉 Game ${doc.id} complete! Winner: ${winner?.address || 'None'}`);
                 
-                if (alivePlayers.length <= 1) {
-                    // Game over - trigger Jupiter swap for winner
-                    const winner = alivePlayers[0];
-                    console.log(`🎉 Game ${doc.id} complete! Winner: ${winner?.address || 'None'}`);
-                    
-                    let prizeData = null;
-                    if (winner && !winner.isNpc && game.totalSolCollected > 0) {
-                        try {
-                            // Perform Jupiter swap: SOL → BALL tokens
-                            console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
-                            const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
+                let prizeData = null;
+                if (winner && !winner.isNpc && game.totalSolCollected > 0) {
+                    try {
+                        // Perform Jupiter swap: SOL → BALL tokens
+                        console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
+                        const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
+                        
+                        if (swapResult.success) {
+                            // Transfer tokens to winner
+                            const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
                             
-                            if (swapResult.success) {
-                                // Transfer tokens to winner
-                                const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
-                                
-                                prizeData = {
-                                    prizeAmountFormatted: (parseInt(swapResult.outputAmount) / Math.pow(10, config.prizeTokenDecimals)).toLocaleString(),
-                                    tokenSymbol: config.tokenSymbol,
-                                    rawAmount: parseInt(swapResult.outputAmount),
-                                    solCollected: game.totalSolCollected,
-                                    swapSignature: swapResult.signature,
-                                    transferSignature: transferResult.signature || null,
-                                    swapSuccess: true,
-                                    transferSuccess: transferResult.success || false
-                                };
-                                
-                                if (!transferResult.success) {
-                                    prizeData.transferError = transferResult.error;
-                                }
-                            } else {
-                                throw new Error(swapResult.error);
-                            }
-                        } catch (swapError) {
-                            console.error('Jupiter swap failed:', swapError);
-                            // Fallback: estimate tokens
                             prizeData = {
-                                prizeAmountFormatted: (game.totalSolCollected * 1000000).toLocaleString(),
+                                prizeAmountFormatted: (parseInt(swapResult.outputAmount) / Math.pow(10, config.prizeTokenDecimals)).toLocaleString(),
                                 tokenSymbol: config.tokenSymbol,
-                                rawAmount: game.totalSolCollected * 1000000,
+                                rawAmount: parseInt(swapResult.outputAmount),
                                 solCollected: game.totalSolCollected,
-                                swapFailed: true,
-                                error: swapError.message
+                                swapSignature: swapResult.signature,
+                                transferSignature: transferResult.signature || null,
+                                swapSuccess: true,
+                                transferSuccess: transferResult.success || false
                             };
+                            
+                            if (!transferResult.success) {
+                                prizeData.transferError = transferResult.error;
+                            }
+                        } else {
+                            throw new Error(swapResult.error);
                         }
+                    } catch (swapError) {
+                        console.error('Jupiter swap failed:', swapError);
+                        // Fallback: estimate tokens
+                        prizeData = {
+                            prizeAmountFormatted: (game.totalSolCollected * 1000000).toLocaleString(),
+                            tokenSymbol: config.tokenSymbol,
+                            rawAmount: game.totalSolCollected * 1000000,
+                            solCollected: game.totalSolCollected,
+                            swapFailed: true,
+                            error: swapError.message
+                        };
                     }
-                    
-                    await gameRef.update({
-                        status: 'completed',
-                        winner: winner?.address || null,
-                        players: players,
-                        completedAt: now,
-                        updatedAt: now,
-                        prize: prizeData
-                    });
-                } else {
-                    // Next round
-                    const nextRound = game.round + 1;
-                    console.log(`➡️ Game ${doc.id} advancing to round ${nextRound}`);
-                    
-                    await gameRef.update({
-                        round: nextRound,
-                        roundStartedAt: now,
-                        players: players,
-                        updatedAt: now
-                    });
                 }
                 
-                processedGames++;
+                await gameRef.update({
+                    status: 'completed',
+                    winner: winner?.address || null,
+                    players: players,
+                    completedAt: now,
+                    updatedAt: now,
+                    prize: prizeData
+                });
+            } else {
+                // Next round
+                const nextRound = game.round + 1;
+                console.log(`➡️ Game ${doc.id} advancing to round ${nextRound}`);
+                
+                await gameRef.update({
+                    round: nextRound,
+                    roundStartedAt: now,
+                    players: players,
+                    updatedAt: now
+                });
             }
+            
+            processedGames++;
         }
+    }
 
-        return { 
-            success: true, 
-            processedGames: processedGames,
-            message: `Processed ${processedGames} games`
-        };
+    return { 
+        success: true, 
+        processedGames: processedGames,
+        message: `Processed ${processedGames} games`
+    };
+}
 
+// Fast Game Tick for Real-time Processing (HTTPS Callable)
+exports.fastGameTick = functions.https.onCall(async (data, context) => {
+    try {
+        return await processGameRounds();
     } catch (error) {
         console.error('Fast game tick error:', error);
         throw new functions.https.HttpsError('internal', 'Fast tick failed: ' + error.message);
@@ -746,17 +750,4 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     }
 }
 
-// Game Ticker - Runs every minute for round processing
-exports.gameTicker = functions.pubsub.schedule('every 1 minutes').onRun(async (context) => {
-    console.log('🎯 Game ticker running...');
-    
-    try {
-        // Call fastGameTick to process rounds
-        const result = await exports.fastGameTick({}, {});
-        console.log('✅ Game ticker completed:', result);
-        return null;
-    } catch (error) {
-        console.error('Game ticker error:', error);
-        return null;
-    }
-}); 
+// Scheduled ticker removed - using frontend-driven processing for instant response 

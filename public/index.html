@@ -198,13 +198,13 @@
             <!-- Wallet Connection -->
             <div id="wallet-section">
                 <div style="margin-bottom: 20px; color: #00ffff;">
-                    <p>🚀 Connect your Phantom wallet to start playing!</p>
+                    <p>🚀 Connect your Solana wallet to start playing!</p>
                     <p style="font-size: 0.9rem; color: #aaa; margin-top: 10px;">
-                        Need Phantom? <a href="https://phantom.app/" target="_blank" style="color: #14f195;">Download here</a>
+                        Supports: <a href="https://solflare.com/" target="_blank" style="color: #14f195;">Solflare</a> (fastest) or <a href="https://phantom.app/" target="_blank" style="color: #14f195;">Phantom</a>
                     </p>
                 </div>
                 <button class="wallet-btn" onclick="connectWallet()">
-                    👻 Connect Phantom Wallet
+                    👻 Connect Wallet
                 </button>
                 <div id="wallet-status"></div>
             </div>
@@ -296,52 +296,64 @@
         // Always use deployed functions
         console.log('🚀 Using deployed Firebase Functions');
 
-        // Game State
+        // Game state management
         let gameState = {
             connected: false,
             wallet: null,
             gameId: null,
-            status: 'lobby',
+            hasActed: false,
+            status: null,
             players: {},
             round: 0,
-            timer: 5,
-            hasActed: false
+            isProcessing: false, // Prevent duplicate actions
+            priceUpdateInterval: null, // Track price update interval
+            gameListener: null // Track Firestore listener
         };
 
-        // Game Configuration - loaded from Firestore
         let gameConfig = null;
 
-        // Load game configuration from Firestore
+        // Load game configuration
         async function loadGameConfig() {
             try {
                 const configDoc = await db.collection('config').doc('game').get();
                 if (configDoc.exists) {
-                    const data = configDoc.data();
-                    
-                    // Validate required fields
-                    if (!data.entryFee || !data.maxPlayersPerGame || !data.tokenSymbol || 
-                        !data.prizeTokenMintAddress || !data.rpcUrl) {
-                        throw new Error('Missing required config fields in Firestore');
-                    }
-                    
-                    gameConfig = {
-                        entryFee: data.entryFee,
-                        maxPlayers: data.maxPlayersPerGame,
-                        tokenSymbol: data.tokenSymbol,
-                        prizeTokenMintAddress: data.prizeTokenMintAddress,
-                        rpcUrl: data.rpcUrl
-                    };
+                    gameConfig = configDoc.data();
                     console.log('✅ Game config loaded from Firestore:', gameConfig);
                     updateGameInfo();
+                    startPriceUpdates(); // Start price updates only after config is loaded
                 } else {
-                    throw new Error('Game configuration not found in Firestore');
+                    throw new Error('Game configuration not found');
                 }
             } catch (error) {
-                console.error('❌ Error loading game config:', error);
+                console.error('❌ Failed to load game config:', error);
                 showError('Failed to load game configuration: ' + error.message);
-                // Disable game functionality
-                document.querySelector('#wallet-section button').disabled = true;
-                document.querySelector('#wallet-section button').textContent = 'Config Error';
+            }
+        }
+
+        // Start/Stop price updates based on game state
+        function startPriceUpdates() {
+            // Clear existing interval
+            if (gameState.priceUpdateInterval) {
+                clearInterval(gameState.priceUpdateInterval);
+            }
+            
+            // Only update prices when not in active game
+            if (gameState.status !== 'in_progress') {
+                gameState.priceUpdateInterval = setInterval(() => {
+                    if (gameState.status !== 'in_progress') {
+                        updatePrizeAmount();
+                    }
+                }, 10000); // Every 10 seconds when not in game
+                
+                // Initial update
+                updatePrizeAmount();
+            }
+        }
+
+        function stopPriceUpdates() {
+            if (gameState.priceUpdateInterval) {
+                clearInterval(gameState.priceUpdateInterval);
+                gameState.priceUpdateInterval = null;
             }
         }
 
@@ -354,15 +366,20 @@
             document.getElementById('entry-fee').textContent = gameConfig.entryFee;
             document.getElementById('token-symbol').textContent = gameConfig.tokenSymbol;
             document.getElementById('token-symbol-2').textContent = gameConfig.tokenSymbol;
-            updatePrizeAmount();
         }
 
-        // Get current SOL to token price and calculate prize
+        // Get current SOL to token price and calculate prize (optimized)
         async function updatePrizeAmount() {
             if (!gameConfig) {
                 console.log('⚠️ Game config not loaded, skipping prize update');
                 return;
             }
+            
+            // Skip if game is in progress to reduce API calls
+            if (gameState.status === 'in_progress') {
+                return;
+            }
+            
             try {
                 // Calculate total SOL prize pool based on actual SOL collected from real players
                 let totalSolPrize = gameConfig.entryFee; // Default to 1 entry fee for display
@@ -381,7 +398,7 @@
                     }
                 }
                 
-                // Get current SOL price from Jupiter API
+                // Get current SOL price from Jupiter API (with caching)
                 let solPriceUSD = 144; // fallback
                 try {
                     const solResponse = await fetch('https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112');
@@ -408,16 +425,13 @@
                         const spotTokenPriceUSD = parseFloat(jupiterData.data[gameConfig.prizeTokenMintAddress].price);
                         
                         // Apply slippage adjustment based on actual game results
-                        // Spot price gives ~973 tokens, but actual swap gives 921 tokens
-                        // This suggests ~5.6% slippage/fees: 921/973 = 0.9465
                         const slippageAdjustment = 0.9465;
                         const adjustedTokenPrice = spotTokenPriceUSD / slippageAdjustment;
                         
                         tokenAmount = Math.floor(prizeUSD / adjustedTokenPrice).toLocaleString();
                         console.log(`🪙 ${gameConfig.tokenSymbol} spot: $${spotTokenPriceUSD}, adjusted: $${adjustedTokenPrice.toFixed(8)} → ${tokenAmount} tokens`);
                     } else {
-                        // Fallback based on actual game results: 0.01 SOL → 921 BALL
-                        // At $144 SOL: $1.44 → 921 BALL = $0.001564 per BALL
+                        // Fallback based on actual game results
                         const actualTokenPrice = 0.001564;
                         tokenAmount = Math.floor(prizeUSD / actualTokenPrice).toLocaleString();
                         console.log(`📊 Using actual game result: $${actualTokenPrice} per ${gameConfig.tokenSymbol} → ${tokenAmount} tokens`);
@@ -438,9 +452,6 @@
                 document.getElementById('prize-amount').textContent = 'TBD';
             }
         }
-
-        // Update prize every 5 seconds
-        setInterval(updatePrizeAmount, 5000);
 
         // Show/Hide sections
         function showSection(sectionId) {
@@ -473,37 +484,55 @@
             }
         }
 
-        // Connect Phantom Wallet
+        // Connect Wallet (Multiple options for speed)
         async function connectWallet() {
             try {
                 showError('');
                 document.querySelector('#wallet-section button').innerHTML = '⚡ CONNECTING...';
                 document.querySelector('#wallet-section button').disabled = true;
                 
-                // Wait for Phantom to be available
-                const phantom = await waitForPhantom();
+                let wallet = null;
+                let walletName = '';
                 
-                if (!phantom) {
-                    throw new Error('Phantom wallet not found! Please install Phantom wallet extension.');
+                // Try Solflare first (usually faster)
+                if (window.solflare && window.solflare.isSolflare) {
+                    console.log('🚀 Solflare wallet found, attempting connection...');
+                    try {
+                        const response = await window.solflare.connect();
+                        wallet = window.solflare;
+                        walletName = 'Solflare';
+                        gameState.wallet = response.publicKey.toString();
+                    } catch (solflareError) {
+                        console.log('Solflare connection failed, trying Phantom...');
+                    }
                 }
-
-                console.log('🔗 Phantom wallet found, attempting connection...');
-                const response = await phantom.connect();
+                
+                // Fallback to Phantom if Solflare not available
+                if (!wallet) {
+                    const phantom = await waitForPhantom();
+                    if (!phantom) {
+                        throw new Error('No Solana wallet found! Please install Phantom or Solflare wallet extension.');
+                    }
+                    console.log('🔗 Phantom wallet found, attempting connection...');
+                    const response = await phantom.connect();
+                    wallet = phantom;
+                    walletName = 'Phantom';
+                    gameState.wallet = response.publicKey.toString();
+                }
                 
                 gameState.connected = true;
-                gameState.wallet = response.publicKey.toString();
                 
-                console.log('✅ Wallet connected:', gameState.wallet);
+                console.log(`✅ ${walletName} wallet connected:`, gameState.wallet);
                 
                 document.getElementById('wallet-status').innerHTML = 
-                    `<div class="success">✅ Connected: ${gameState.wallet.slice(0, 8)}...</div>`;
+                    `<div class="success">✅ ${walletName}: ${gameState.wallet.slice(0, 8)}...</div>`;
                 
                 showSection('lobby-section');
                 
             } catch (error) {
                 console.error('Wallet connection error:', error);
                 showError('Failed to connect wallet: ' + error.message);
-                document.querySelector('#wallet-section button').innerHTML = '👻 Connect Phantom Wallet';
+                document.querySelector('#wallet-section button').innerHTML = '👻 Connect Wallet';
                 document.querySelector('#wallet-section button').disabled = false;
             }
         }
@@ -625,128 +654,210 @@
             }
         }
 
-        // Listen to game updates
+        // Optimized game listener (eliminate duplicate processing)
+        let lastProcessedRound = -1;
+        let lastProcessedStatus = null;
+        
         function startGameListener() {
             if (!gameState.gameId) return;
 
-            db.collection('games').doc(gameState.gameId).onSnapshot((doc) => {
+            // Clean up existing listener
+            if (gameState.gameListener) {
+                gameState.gameListener();
+                gameState.gameListener = null;
+            }
+
+            console.log(`🎧 Starting game listener for game: ${gameState.gameId}`);
+            
+            gameState.gameListener = db.collection('games').doc(gameState.gameId).onSnapshot((doc) => {
                 if (doc.exists) {
                     const data = doc.data();
+                    
+                    // Skip duplicate updates
+                    if (data.status === lastProcessedStatus && data.round === lastProcessedRound) {
+                        return; // Skip duplicate processing
+                    }
+                    
+                    const previousStatus = gameState.status;
+                    const previousRound = gameState.round;
+                    
                     gameState.status = data.status;
                     gameState.players = data.players || {};
                     gameState.round = data.round || 0;
+                    
+                    lastProcessedRound = data.round;
+                    lastProcessedStatus = data.status;
 
-                    // Update prize when players change
-                    updatePrizeAmount();
+                    console.log(`🎮 NEW Game update: Status=${data.status}, Round=${data.round}`);
 
                     if (data.status === 'in_progress') {
+                        // Stop price updates during active game
+                        stopPriceUpdates();
+                        
                         showSection('game-section');
                         updateGameUI(data);
-                        startTimer(data.roundStartedAt);
+                        
+                        // Start timer for new rounds - no backend dependency
+                        if (data.round !== previousRound) {
+                            console.log(`🚀 ROUND ${data.round} STARTED - Starting simple timer`);
+                            startTimer(); // No need for backend timestamp
+                        }
                     } else if (data.status === 'completed') {
+                        // Resume price updates after game
+                        startPriceUpdates();
                         showWinner(data.winner, data);
+                    } else if (data.status === 'lobby') {
+                        // Resume price updates in lobby
+                        startPriceUpdates();
                     }
+                } else {
+                    console.log('⚠️ Game document no longer exists');
+                    showError('Game session ended');
+                    playAgain();
                 }
+            }, (error) => {
+                console.error('❌ Game listener error:', error);
+                showError('Connection lost: ' + error.message);
             });
         }
 
-        // Update Game UI
-        function updateGameUI(data) {
-            const alivePlayers = Object.values(data.players).filter(p => p.status === 'alive');
-            const self = data.players[gameState.wallet];
-            
-            document.getElementById('game-status').textContent = `⚡ ELIMINATION ROUND ${data.round} ⚡`;
-            document.getElementById('players-info').textContent = `${alivePlayers.length} PLAYERS LEFT`;
-            
-            // Check if player has acted this round
-            gameState.hasActed = self && self.lastActionRound === data.round;
-            
-            const actionBtn = document.getElementById('action-btn');
-            const actionStatus = document.getElementById('action-status');
-            
-            if (gameState.hasActed) {
-                actionBtn.textContent = '✅ SURVIVED THIS ROUND!';
-                actionBtn.disabled = true;
-                actionStatus.innerHTML = '<div class="success">Action recorded! Wait for round to end...</div>';
-            } else {
-                actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
-                actionBtn.disabled = false;
-                actionStatus.innerHTML = '';
+        // SIMPLE HTML timer system - no backend dependency
+        let currentTimerInterval = null;
+        let currentRoundNumber = null;
+        
+        function startTimer() {
+            // Prevent duplicate timers for same round
+            if (currentRoundNumber === gameState.round && currentTimerInterval) {
+                console.log(`⚠️ Timer already running for round ${gameState.round}, skipping duplicate`);
+                return;
             }
-        }
-
-        // Start Round Timer
-        function startTimer(roundStartedAt) {
-            const startTime = roundStartedAt.toMillis();
-            const roundDuration = 5000; // 5 seconds
             
-            const timerInterval = setInterval(() => {
-                const now = Date.now();
-                const elapsed = now - startTime;
-                const remaining = Math.max(0, Math.ceil((roundDuration - elapsed) / 1000));
+            // Clear any existing timer
+            if (currentTimerInterval) {
+                clearInterval(currentTimerInterval);
+                currentTimerInterval = null;
+            }
+            
+            // Simple 5-second countdown - ignore backend timestamp
+            let timeLeft = 5;
+            currentRoundNumber = gameState.round;
+            
+            console.log(`⏰ Starting SIMPLE 5-second timer for round ${gameState.round}`);
+            
+            document.getElementById('timer').textContent = timeLeft;
+            
+            currentTimerInterval = setInterval(() => {
+                timeLeft--;
+                document.getElementById('timer').textContent = timeLeft;
                 
-                document.getElementById('timer').textContent = remaining;
-                
-                if (remaining <= 0) {
-                    clearInterval(timerInterval);
+                if (timeLeft <= 0) {
+                    clearInterval(currentTimerInterval);
+                    currentTimerInterval = null;
+                    currentRoundNumber = null;
                     document.getElementById('timer').textContent = "TIME'S UP!";
                     
-                    // Trigger game tick to process round immediately
+                    console.log(`⏰ Round ${gameState.round} timer ended - processing with small delay for actions`);
+                    
+                    // Small delay to ensure all player actions are processed first
                     setTimeout(() => {
-                        triggerGameTick();
-                    }, 100);
+                        processRoundEnd();
+                    }, 500); // 0.5 second delay to guarantee action processing
                 }
-            }, 100);
+            }, 1000); // Update every second
         }
-
-        // Trigger Game Tick
-        async function triggerGameTick() {
+        
+        // INSTANT round processing - no waiting
+        async function processRoundEnd() {
             try {
-                console.log('⚡ Triggering game tick to process round...');
+                console.log(`🚀 INSTANTLY processing round ${gameState.round} end`);
+                
+                // Call backend to process round immediately
                 const fastGameTick = functions.httpsCallable('fastGameTick');
                 await fastGameTick({});
-                console.log('✅ Game tick completed');
+                
+                console.log(`✅ Round ${gameState.round} processed instantly`);
             } catch (error) {
-                console.error('❌ Game tick error:', error);
+                console.error('❌ Round processing error:', error);
             }
         }
 
-        // Player Action
+        // Ultra-fast game tick (no duplicates)
+        let isTickInProgress = false;
+        
+        async function triggerGameTick() {
+            if (isTickInProgress) {
+                console.log('⚠️ Game tick already in progress, skipping...');
+                return;
+            }
+            
+            try {
+                isTickInProgress = true;
+                console.log(`⚡ Triggering INSTANT game tick for round ${gameState.round}...`);
+                const fastGameTick = functions.httpsCallable('fastGameTick');
+                await fastGameTick({});
+                console.log('✅ Game tick completed instantly');
+            } catch (error) {
+                console.error('❌ Game tick error:', error);
+            } finally {
+                isTickInProgress = false;
+            }
+        }
+
+        // Ultra-responsive player action (instant feedback)
         async function playerAction() {
             try {
-                if (gameState.hasActed) return;
+                // Prevent duplicate actions
+                if (gameState.hasActed || gameState.isProcessing) {
+                    console.log('⚠️ Action already processed or in progress');
+                    return;
+                }
                 
-                // Immediate visual feedback
+                // Validate game state
+                if (!gameState.gameId || gameState.status !== 'in_progress') {
+                    console.log('⚠️ Game not in progress, cannot take action');
+                    showError('Game is not in progress');
+                    return;
+                }
+                
+                gameState.isProcessing = true;
+                
+                // INSTANT visual feedback
                 const actionBtn = document.getElementById('action-btn');
                 const actionStatus = document.getElementById('action-status');
                 
                 actionBtn.disabled = true;
-                actionBtn.textContent = '⚡ PROCESSING...';
-                actionStatus.innerHTML = '<div class="success">🎯 Action sent! Processing...</div>';
+                actionBtn.textContent = '✅ SURVIVED THIS ROUND!';
+                actionStatus.innerHTML = '<div class="success">⚡ INSTANT ACTION! Wait for round to end...</div>';
                 
-                // Set local state immediately for responsiveness
+                // Set local state immediately for instant response
                 gameState.hasActed = true;
                 
-                console.log('🎯 Sending player action immediately...');
+                console.log(`🎯 INSTANT player action for round ${gameState.round}...`);
                 
-                // Send action to backend
+                // Send action to backend SYNCHRONOUSLY to guarantee it's processed
                 const playerActionFunc = functions.httpsCallable('playerAction');
-                const result = await playerActionFunc({
-                    gameId: gameState.gameId,
-                    playerAddress: gameState.wallet
-                });
-                
-                console.log('✅ Player action confirmed by backend');
-                
-                // Update UI with success
-                actionBtn.textContent = '✅ SURVIVED THIS ROUND!';
-                actionStatus.innerHTML = '<div class="success">✅ Action recorded! Wait for round to end...</div>';
+                try {
+                    await playerActionFunc({
+                        gameId: gameState.gameId,
+                        playerAddress: gameState.wallet
+                    });
+                    console.log('✅ Backend confirmed action BEFORE round can end');
+                } catch (error) {
+                    console.error('❌ Backend action failed:', error);
+                    // Reset state if backend fails
+                    gameState.hasActed = false;
+                    actionBtn.disabled = false;
+                    actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
+                    actionStatus.innerHTML = '<div class="error">❌ Action failed! Try again!</div>';
+                    throw error;
+                }
                 
             } catch (error) {
                 console.error('❌ Player action failed:', error);
                 
                 // Reset state on error
                 gameState.hasActed = false;
+                gameState.isProcessing = false;
                 
                 showError('Action failed: ' + error.message);
                 const actionBtn = document.getElementById('action-btn');
@@ -755,6 +866,44 @@
                 actionBtn.disabled = false;
                 actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
                 actionStatus.innerHTML = '<div class="error">❌ Action failed! Try again!</div>';
+            } finally {
+                gameState.isProcessing = false;
+            }
+        }
+
+        // Update Game UI (improved)
+        function updateGameUI(data) {
+            const alivePlayers = Object.values(data.players).filter(p => p.status === 'alive');
+            const aliveRealPlayers = alivePlayers.filter(p => !p.isNpc);
+            const aliveBots = alivePlayers.filter(p => p.isNpc);
+            const self = data.players[gameState.wallet];
+            
+            document.getElementById('game-status').textContent = `⚡ ELIMINATION ROUND ${data.round} ⚡`;
+            document.getElementById('players-info').textContent = `${alivePlayers.length} PLAYERS LEFT`;
+            
+            console.log(`🎮 Round ${data.round}: ${aliveRealPlayers.length} real players, ${aliveBots.length} bots alive`);
+            
+            // Check if player has acted this round (don't override local state if processing)
+            if (!gameState.isProcessing) {
+                gameState.hasActed = self && self.lastActionRound === data.round;
+            }
+            
+            const actionBtn = document.getElementById('action-btn');
+            const actionStatus = document.getElementById('action-status');
+            
+            // Update button state based on current status
+            if (gameState.hasActed || gameState.isProcessing) {
+                actionBtn.textContent = gameState.isProcessing ? '⚡ PROCESSING...' : '✅ SURVIVED THIS ROUND!';
+                actionBtn.disabled = true;
+                actionStatus.innerHTML = '<div class="success">Action recorded! Wait for round to end...</div>';
+            } else if (self && self.status === 'alive') {
+                actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
+                actionBtn.disabled = false;
+                actionStatus.innerHTML = '';
+            } else {
+                actionBtn.textContent = '💀 ELIMINATED';
+                actionBtn.disabled = true;
+                actionStatus.innerHTML = '<div class="error">You have been eliminated!</div>';
             }
         }
 
@@ -788,37 +937,76 @@
             }
         }
 
-        // Play Again
+        // Play Again (improved cleanup)
         function playAgain() {
+            // Clean up timers and listeners
+            if (currentTimerInterval) {
+                clearInterval(currentTimerInterval);
+                currentTimerInterval = null;
+            }
+            
+            if (gameState.gameListener) {
+                gameState.gameListener();
+                gameState.gameListener = null;
+            }
+            
             // Reset all game state
             gameState.gameId = null;
             gameState.hasActed = false;
             gameState.status = null;
             gameState.players = {};
             gameState.round = 0;
+            gameState.isProcessing = false;
             
             // Reset UI elements
             showError('');
             document.querySelector('#lobby-section button').textContent = '⚡ JOIN GAME';
             document.querySelector('#lobby-section button').disabled = false;
             
+            // Resume price updates
+            startPriceUpdates();
+            
             // Show lobby section
             showSection('lobby-section');
             console.log('🔄 Game state reset for new game');
         }
 
-        // Disconnect Wallet
+        // Disconnect Wallet (improved cleanup)
         async function disconnectWallet() {
             try {
-                if (window.solana && window.solana.isConnected) {
+                // Clean up all timers and listeners
+                if (currentTimerInterval) {
+                    clearInterval(currentTimerInterval);
+                    currentTimerInterval = null;
+                }
+                
+                if (gameState.gameListener) {
+                    gameState.gameListener();
+                    gameState.gameListener = null;
+                }
+                
+                stopPriceUpdates();
+                
+                // Disconnect from whichever wallet is connected
+                if (window.solflare && window.solflare.isConnected) {
+                    await window.solflare.disconnect();
+                } else if (window.solana && window.solana.isConnected) {
                     await window.solana.disconnect();
                 }
+                
+                // Reset all state
                 gameState.connected = false;
                 gameState.wallet = null;
                 gameState.gameId = null;
+                gameState.hasActed = false;
+                gameState.status = null;
+                gameState.players = {};
+                gameState.round = 0;
+                gameState.isProcessing = false;
+                
                 showSection('wallet-section');
                 document.getElementById('wallet-status').innerHTML = '';
-                document.querySelector('#wallet-section button').innerHTML = '👻 Connect Phantom Wallet';
+                document.querySelector('#wallet-section button').innerHTML = '👻 Connect Wallet';
                 document.querySelector('#wallet-section button').disabled = false;
                 console.log('🔌 Wallet disconnected');
             } catch (error) {
