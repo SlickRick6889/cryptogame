@@ -209,13 +209,33 @@
 
             <!-- Game Lobby -->
             <div id="lobby-section" class="hidden">
-                <div class="status">Ready to Play?</div>
+                <div class="status">🎮 Multiplayer Battle Royale</div>
                 <div id="game-info" style="margin: 15px 0; color: #ffff00;">
                     💰 Entry Fee: <span id="entry-fee">Loading...</span> SOL per player<br>
-                    🏆 Prize: ~<span id="prize-amount">Loading...</span> $<span id="token-symbol">BALL</span> tokens<br>
-                    <small style="color: #aaa;">SOL collected, swapped to <span id="token-symbol-2">BALL</span> tokens for winner</small>
+                    🏆 Prize: Winner takes all SOL (swapped to $<span id="token-symbol">BALL</span> tokens)<br>
+                    <small style="color: #aaa;">Real players only - slowest eliminated each round!</small>
                 </div>
-                <button class="action-btn" onclick="joinGame()">🎯 JOIN GAME</button>
+                <button class="action-btn" onclick="joinGame()">🎯 JOIN MULTIPLAYER GAME</button>
+            </div>
+
+            <!-- Waiting/Lobby States -->
+            <div id="waiting-section" class="hidden">
+                <div class="status" id="waiting-status">⏳ Waiting for Players...</div>
+                <div id="waiting-info" style="margin: 20px 0; color: #00ffff;">
+                    <div id="game-id-display" style="font-size: 1.2rem; margin-bottom: 10px;"></div>
+                    <div id="player-count-display" style="font-size: 1.1rem; margin-bottom: 15px;"></div>
+                    <div id="countdown-display" style="font-size: 2rem; color: #ff0000; margin: 15px 0;"></div>
+                    <div id="waiting-message" style="color: #aaa; font-size: 0.9rem;"></div>
+                </div>
+                <button class="action-btn" id="refund-btn" onclick="requestRefund()" style="background: linear-gradient(45deg, #ff4444, #ff0000);">
+                    💰 LEAVE & GET REFUND
+                </button>
+                <button class="action-btn" id="cleanup-btn" onclick="cleanupOldGames()" style="background: linear-gradient(45deg, #ffaa00, #ff8800); margin-top: 10px;">
+                    🧹 CLEAN UP OLD GAMES
+                </button>
+                <div id="refund-info" style="margin-top: 10px; color: #aaa; font-size: 0.8rem;">
+                    Refund: Entry fee minus 0.0005 SOL transfer fee
+                </div>
             </div>
 
             <!-- Game In Progress -->
@@ -524,12 +544,18 @@
                 console.log('⚠️ Game config not loaded yet');
                 return;
             }
-            document.getElementById('entry-fee').textContent = gameConfig.entryFee;
-            document.getElementById('token-symbol').textContent = gameConfig.tokenSymbol;
-            document.getElementById('token-symbol-2').textContent = gameConfig.tokenSymbol;
+            
+            // Safely update elements if they exist
+            const entryFeeEl = document.getElementById('entry-fee');
+            const tokenSymbolEl = document.getElementById('token-symbol');
+            
+            if (entryFeeEl) entryFeeEl.textContent = gameConfig.entryFee;
+            if (tokenSymbolEl) tokenSymbolEl.textContent = gameConfig.tokenSymbol;
+            
+            console.log(`💰 Game info updated: ${gameConfig.entryFee} SOL entry, max ${gameConfig.maxPlayersPerGame} players`);
         }
 
-        // Get current SOL to token price and calculate prize (optimized)
+        // Get current SOL to token price and calculate prize (multiplayer)
         async function updatePrizeAmount() {
             if (!gameConfig) {
                 console.log('⚠️ Game config not loaded, skipping prize update');
@@ -541,76 +567,58 @@
                 return;
             }
             
+            // Skip if prize amount element doesn't exist (we removed it for multiplayer)
+            const prizeAmountEl = document.getElementById('prize-amount');
+            if (!prizeAmountEl) {
+                return;
+            }
+            
             try {
-                // Calculate total SOL prize pool based on actual SOL collected from real players
-                let totalSolPrize = gameConfig.entryFee; // Default to 1 entry fee for display
-                let realPlayersCount = 1;
+                // For multiplayer, show estimated prize based on max players
+                const maxPlayers = gameConfig.maxPlayersPerGame || 5;
+                const totalSolPrize = gameConfig.entryFee * maxPlayers;
                 
-                // If we have game data, calculate based on actual payments
-                if (gameState.players && Object.keys(gameState.players).length > 0) {
-                    const realPlayers = Object.values(gameState.players).filter(p => !p.isNpc && p.solPaid > 0);
-                    realPlayersCount = realPlayers.length;
-                    totalSolPrize = realPlayers.reduce((sum, player) => sum + (player.solPaid || 0), 0);
-                    
-                    // If no real players found but we have a gameId, assume 1 real player (us)
-                    if (realPlayersCount === 0 && gameState.gameId) {
-                        realPlayersCount = 1;
-                        totalSolPrize = gameConfig.entryFee;
-                    }
-                }
-                
-                // Get current SOL price from Jupiter API (with caching)
+                // Get current SOL price from Jupiter API
                 let solPriceUSD = 144; // fallback
                 try {
                     const solResponse = await fetch('https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112');
                     const solData = await solResponse.json();
                     if (solData.data && solData.data['So11111111111111111111111111111111111111112']) {
                         solPriceUSD = parseFloat(solData.data['So11111111111111111111111111111111111111112'].price);
-                        console.log(`📊 SOL price: $${solPriceUSD}`);
                     }
                 } catch (error) {
                     console.log('Using fallback SOL price: $144');
                 }
                 
-                // Calculate USD value of prize
+                // Calculate USD value of max prize
                 const prizeUSD = totalSolPrize * solPriceUSD;
                 
-                // Get token price (if available) or estimate
+                // Estimate token amount
                 let tokenAmount = 'TBD';
                 try {
-                    // Try to get token price from Jupiter API
                     const jupiterResponse = await fetch(`https://api.jup.ag/price/v2?ids=${gameConfig.prizeTokenMintAddress}`);
                     const jupiterData = await jupiterResponse.json();
                     
                     if (jupiterData.data && jupiterData.data[gameConfig.prizeTokenMintAddress]) {
                         const spotTokenPriceUSD = parseFloat(jupiterData.data[gameConfig.prizeTokenMintAddress].price);
-                        
-                        // Apply slippage adjustment based on actual game results
                         const slippageAdjustment = 0.9465;
                         const adjustedTokenPrice = spotTokenPriceUSD / slippageAdjustment;
-                        
                         tokenAmount = Math.floor(prizeUSD / adjustedTokenPrice).toLocaleString();
-                        console.log(`🪙 ${gameConfig.tokenSymbol} spot: $${spotTokenPriceUSD}, adjusted: $${adjustedTokenPrice.toFixed(8)} → ${tokenAmount} tokens`);
                     } else {
-                        // Fallback based on actual game results
                         const actualTokenPrice = 0.001564;
                         tokenAmount = Math.floor(prizeUSD / actualTokenPrice).toLocaleString();
-                        console.log(`📊 Using actual game result: $${actualTokenPrice} per ${gameConfig.tokenSymbol} → ${tokenAmount} tokens`);
                     }
                 } catch (error) {
-                    // Fallback based on actual game results
                     const actualTokenPrice = 0.001564;
                     tokenAmount = Math.floor(prizeUSD / actualTokenPrice).toLocaleString();
-                    console.log(`📊 API failed, using actual game result: $${actualTokenPrice} per ${gameConfig.tokenSymbol} → ${tokenAmount} tokens`);
                 }
                 
-                document.getElementById('prize-amount').textContent = tokenAmount;
-                const totalPlayers = Object.keys(gameState.players || {}).length;
-                console.log(`💰 Prize updated: ${totalSolPrize} SOL (${realPlayersCount} real players, ${totalPlayers} total) (~$${prizeUSD.toFixed(2)}) → ~${tokenAmount} ${gameConfig.tokenSymbol}`);
+                prizeAmountEl.textContent = tokenAmount;
+                console.log(`💰 Max prize estimate: ${totalSolPrize} SOL (${maxPlayers} players) → ~${tokenAmount} ${gameConfig.tokenSymbol}`);
                 
             } catch (error) {
                 console.error('❌ Error updating prize amount:', error);
-                document.getElementById('prize-amount').textContent = 'TBD';
+                if (prizeAmountEl) prizeAmountEl.textContent = 'TBD';
             }
         }
 
@@ -913,7 +921,7 @@
             }
         }
 
-        // Join Game
+        // Join Multiplayer Game
         async function joinGame() {
             try {
                 if (!gameState.connected || !gameState.wallet) {
@@ -925,7 +933,7 @@
                 document.querySelector('#lobby-section button').textContent = '⚡ JOINING...';
                 document.querySelector('#lobby-section button').disabled = true;
                 
-                console.log('🎮 Attempting to join game with wallet:', gameState.wallet);
+                console.log('🎮 Attempting to join multiplayer game with wallet:', gameState.wallet);
                 
                 const joinLobby = functions.httpsCallable('joinLobby');
                 const result = await joinLobby({ playerAddress: gameState.wallet });
@@ -941,7 +949,7 @@
                     const success = await sendPayment(result.data.treasuryAddress, result.data.entryFee);
                     
                     if (!success) {
-                        document.querySelector('#lobby-section button').textContent = '🎯 JOIN GAME';
+                        document.querySelector('#lobby-section button').textContent = '🎯 JOIN MULTIPLAYER GAME';
                         document.querySelector('#lobby-section button').disabled = false;
                         return;
                     }
@@ -961,19 +969,107 @@
                     }
                     
                     gameState.gameId = retryResult.data.gameId;
+                    gameState.maxPlayers = retryResult.data.maxPlayers;
                 } else if (result.data.success) {
                     gameState.gameId = result.data.gameId;
+                    gameState.maxPlayers = result.data.maxPlayers;
                 } else {
                     throw new Error(result.data.message || 'Failed to join game');
                 }
                 
+                console.log(`🎮 Joined game ${gameState.gameId} with max ${gameState.maxPlayers} players`);
                 startGameListener();
                 
             } catch (error) {
                 console.error('❌ Join game error:', error);
                 showError('Failed to join game: ' + error.message);
-                document.querySelector('#lobby-section button').textContent = '🎯 JOIN GAME';
+                document.querySelector('#lobby-section button').textContent = '🎯 JOIN MULTIPLAYER GAME';
                 document.querySelector('#lobby-section button').disabled = false;
+            }
+        }
+
+        // Request Refund
+        async function requestRefund() {
+            try {
+                if (!gameState.gameId) {
+                    showError('No active game to refund');
+                    return;
+                }
+                
+                showError('');
+                document.getElementById('refund-btn').textContent = '⚡ PROCESSING REFUND...';
+                document.getElementById('refund-btn').disabled = true;
+                
+                console.log('💰 Requesting refund for game:', gameState.gameId);
+                
+                const requestRefundFunc = functions.httpsCallable('requestRefund');
+                const result = await requestRefundFunc({ 
+                    gameId: gameState.gameId,
+                    playerAddress: gameState.wallet 
+                });
+                
+                console.log('✅ Refund result:', result.data);
+                
+                if (result.data.success) {
+                    showError(''); // Clear any errors
+                    document.getElementById('waiting-message').innerHTML = 
+                        `<div class="success">✅ ${result.data.message}</div>`;
+                    
+                    // Go back to lobby after successful refund
+                    setTimeout(() => {
+                        playAgain();
+                    }, 2000);
+                } else {
+                    throw new Error(result.data.message || 'Refund failed');
+                }
+                
+            } catch (error) {
+                console.error('❌ Refund error:', error);
+                showError('Refund failed: ' + error.message);
+                document.getElementById('refund-btn').textContent = '💰 LEAVE & GET REFUND';
+                document.getElementById('refund-btn').disabled = false;
+            }
+        }
+
+        // Clean up old games function
+        async function cleanupOldGames() {
+            try {
+                if (!gameState.wallet) {
+                    showError('Please connect your wallet first');
+                    return;
+                }
+                
+                showError('');
+                document.getElementById('cleanup-btn').textContent = '⚡ CLEANING UP...';
+                document.getElementById('cleanup-btn').disabled = true;
+                
+                console.log('🧹 Cleaning up old games for wallet:', gameState.wallet);
+                
+                const cleanupFunc = functions.httpsCallable('cleanupOldGames');
+                const result = await cleanupFunc({ 
+                    playerAddress: gameState.wallet 
+                });
+                
+                console.log('✅ Cleanup result:', result.data);
+                
+                if (result.data.success) {
+                    showError(''); // Clear any errors
+                    document.getElementById('waiting-message').innerHTML = 
+                        `<div class="success">✅ ${result.data.message}</div>`;
+                    
+                    // Go back to lobby after successful cleanup
+                    setTimeout(() => {
+                        playAgain();
+                    }, 2000);
+                } else {
+                    throw new Error(result.data.message || 'Cleanup failed');
+                }
+                
+            } catch (error) {
+                console.error('❌ Cleanup error:', error);
+                showError('Cleanup failed: ' + error.message);
+                document.getElementById('cleanup-btn').textContent = '🧹 CLEAN UP OLD GAMES';
+                document.getElementById('cleanup-btn').disabled = false;
             }
         }
 
@@ -1030,9 +1126,10 @@
             }
         }
 
-        // Optimized game listener (eliminate duplicate processing)
+        // Multiplayer game listener with lobby states
         let lastProcessedRound = -1;
         let lastProcessedStatus = null;
+        let countdownInterval = null;
         
         function startGameListener() {
             if (!gameState.gameId) return;
@@ -1043,14 +1140,14 @@
                 gameState.gameListener = null;
             }
 
-            console.log(`🎧 Starting game listener for game: ${gameState.gameId}`);
+            console.log(`🎧 Starting multiplayer game listener for game: ${gameState.gameId}`);
             
             gameState.gameListener = db.collection('games').doc(gameState.gameId).onSnapshot((doc) => {
                 if (doc.exists) {
                     const data = doc.data();
                     
                     // Skip duplicate updates
-                    if (data.status === lastProcessedStatus && data.round === lastProcessedRound) {
+                    if (data.status === lastProcessedStatus && data.round === lastProcessedRound && data.playerCount === gameState.playerCount) {
                         return; // Skip duplicate processing
                     }
                     
@@ -1060,31 +1157,54 @@
                     gameState.status = data.status;
                     gameState.players = data.players || {};
                     gameState.round = data.round || 0;
+                    gameState.playerCount = data.playerCount || 0;
+                    gameState.maxPlayers = data.maxPlayers || gameState.maxPlayers;
                     
                     lastProcessedRound = data.round;
                     lastProcessedStatus = data.status;
 
-                    console.log(`🎮 NEW Game update: Status=${data.status}, Round=${data.round}`);
+                    console.log(`🎮 Multiplayer update: Status=${data.status}, Round=${data.round}, Players=${data.playerCount}/${gameState.maxPlayers}`);
 
-                    if (data.status === 'in_progress') {
-                        // Stop price updates during active game
+                    if (data.status === 'waiting') {
+                        // First player waiting for second
                         stopPriceUpdates();
-                        
+                        showSection('waiting-section');
+                        updateWaitingUI(data);
+                    } else if (data.status === 'lobby') {
+                        // 2+ players, countdown active
+                        stopPriceUpdates();
+                        showSection('waiting-section');
+                        updateLobbyUI(data);
+                        startCountdown(data);
+                    } else if (data.status === 'starting') {
+                        // Max players reached, starting immediately
+                        stopPriceUpdates();
+                        showSection('waiting-section');
+                        updateStartingUI(data);
+                        stopCountdown();
+                    } else if (data.status === 'in_progress') {
+                        // Game active
+                        stopPriceUpdates();
+                        stopCountdown();
                         showSection('game-section');
                         updateGameUI(data);
                         
-                        // Start timer for new rounds - no backend dependency
+                        // Start timer for new rounds
                         if (data.round !== previousRound) {
-                            console.log(`🚀 ROUND ${data.round} STARTED - Starting simple timer`);
-                            startTimer(); // No need for backend timestamp
+                            console.log(`🚀 ROUND ${data.round} STARTED - Starting multiplayer timer`);
+                            startTimer();
                         }
                     } else if (data.status === 'completed') {
-                        // Resume price updates after game
+                        // Game finished
                         startPriceUpdates();
+                        stopCountdown();
                         showWinner(data.winner, data);
-                    } else if (data.status === 'lobby') {
-                        // Resume price updates in lobby
+                    } else if (data.status === 'cancelled') {
+                        // Game cancelled (no players left)
                         startPriceUpdates();
+                        stopCountdown();
+                        showError('Game cancelled - all players left');
+                        playAgain();
                     }
                 } else {
                     console.log('⚠️ Game document no longer exists');
@@ -1095,6 +1215,80 @@
                 console.error('❌ Game listener error:', error);
                 showError('Connection lost: ' + error.message);
             });
+        }
+
+        // Update UI for waiting state (1 player)
+        function updateWaitingUI(data) {
+            document.getElementById('waiting-status').textContent = '⏳ Waiting for Players...';
+            document.getElementById('game-id-display').textContent = `Game: ${gameState.gameId}`;
+            document.getElementById('player-count-display').textContent = `${data.playerCount}/${gameState.maxPlayers} players joined`;
+            document.getElementById('countdown-display').textContent = '';
+            document.getElementById('waiting-message').textContent = 'Waiting for at least one more player to join...';
+            
+            // Show refund button
+            document.getElementById('refund-btn').style.display = 'inline-block';
+        }
+
+        // Update UI for lobby state (2+ players, countdown active)
+        function updateLobbyUI(data) {
+            document.getElementById('waiting-status').textContent = '🚀 Game Starting Soon!';
+            document.getElementById('game-id-display').textContent = `Game: ${gameState.gameId}`;
+            document.getElementById('player-count-display').textContent = `${data.playerCount}/${gameState.maxPlayers} players ready`;
+            document.getElementById('waiting-message').textContent = 'Countdown resets when new players join. Leave now for refund!';
+            
+            // Show refund button
+            document.getElementById('refund-btn').style.display = 'inline-block';
+        }
+
+        // Update UI for starting state (max players, no refunds)
+        function updateStartingUI(data) {
+            document.getElementById('waiting-status').textContent = '🎮 GAME STARTING NOW!';
+            document.getElementById('game-id-display').textContent = `Game: ${gameState.gameId}`;
+            document.getElementById('player-count-display').textContent = `${data.playerCount}/${gameState.maxPlayers} players - FULL!`;
+            document.getElementById('countdown-display').textContent = 'STARTING...';
+            document.getElementById('waiting-message').textContent = 'Game is full! No refunds allowed.';
+            
+            // Hide refund button
+            document.getElementById('refund-btn').style.display = 'none';
+        }
+
+        // Countdown timer for lobby
+        function startCountdown(data) {
+            if (!data.countdownStartedAt) return;
+            
+            stopCountdown(); // Clear any existing countdown
+            
+            const countdownDuration = data.countdownDuration || 15; // 15 seconds default
+            const startTime = data.countdownStartedAt.toMillis();
+            
+            console.log(`⏰ Starting ${countdownDuration}s countdown for game ${gameState.gameId}`);
+            
+            countdownInterval = setInterval(() => {
+                const now = Date.now();
+                const elapsed = (now - startTime) / 1000;
+                const remaining = Math.max(0, countdownDuration - elapsed);
+                
+                if (remaining > 0) {
+                    document.getElementById('countdown-display').textContent = `${Math.ceil(remaining)}s`;
+                } else {
+                    document.getElementById('countdown-display').textContent = 'STARTING...';
+                    stopCountdown();
+                    
+                    // Automatically trigger game start when countdown ends
+                    console.log('⏰ Countdown ended - triggering game start');
+                    setTimeout(() => {
+                        triggerGameTick();
+                    }, 500); // Small delay to ensure UI updates
+                }
+            }, 100); // Update every 100ms for smooth countdown
+        }
+
+        // Stop countdown timer
+        function stopCountdown() {
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+                countdownInterval = null;
+            }
         }
 
         // SIMPLE HTML timer system - no backend dependency
@@ -1134,10 +1328,10 @@
                     
                     console.log(`⏰ Round ${gameState.round} timer ended - processing with small delay for actions`);
                     
-                    // Small delay to ensure all player actions are processed first
+                    // Wait for backend round duration (8 seconds) plus buffer
                     setTimeout(() => {
                         processRoundEnd();
-                    }, 500); // 0.5 second delay to guarantee action processing
+                    }, 3500); // 3.5 second delay (5 + 3.5 = 8.5 seconds total)
                 }
             }, 1000); // Update every second
         }
@@ -1179,7 +1373,7 @@
             }
         }
 
-        // Ultra-responsive player action (instant feedback)
+        // Multiplayer player action with response time tracking
         async function playerAction() {
             try {
                 // Prevent duplicate actions
@@ -1196,28 +1390,35 @@
                 }
                 
                 gameState.isProcessing = true;
+                const actionTime = Date.now(); // Record client-side action time
                 
                 // INSTANT visual feedback
                 const actionBtn = document.getElementById('action-btn');
                 const actionStatus = document.getElementById('action-status');
                 
                 actionBtn.disabled = true;
-                actionBtn.textContent = '✅ SURVIVED THIS ROUND!';
-                actionStatus.innerHTML = '<div class="success">⚡ INSTANT ACTION! Wait for round to end...</div>';
+                actionBtn.textContent = '⚡ ACTION RECORDED!';
+                actionStatus.innerHTML = '<div class="success">🎯 Response recorded! Waiting for other players...</div>';
                 
                 // Set local state immediately for instant response
                 gameState.hasActed = true;
                 
-                console.log(`🎯 INSTANT player action for round ${gameState.round}...`);
+                console.log(`🎯 Multiplayer action for round ${gameState.round} at ${actionTime}...`);
                 
-                // Send action to backend SYNCHRONOUSLY to guarantee it's processed
+                // Send action to backend with client timestamp for response time calculation
                 const playerActionFunc = functions.httpsCallable('playerAction');
                 try {
-                    await playerActionFunc({
+                    const result = await playerActionFunc({
                         gameId: gameState.gameId,
-                        playerAddress: gameState.wallet
+                        playerAddress: gameState.wallet,
+                        clientTimestamp: actionTime
                     });
-                    console.log('✅ Backend confirmed action BEFORE round can end');
+                    
+                    console.log(`✅ Action confirmed - Response time: ${result.data.responseTime}ms`);
+                    
+                    // Update UI with response time
+                    actionStatus.innerHTML = `<div class="success">⚡ Response time: ${result.data.responseTime}ms - Waiting for round to end...</div>`;
+                    
                 } catch (error) {
                     console.error('❌ Backend action failed:', error);
                     // Reset state if backend fails
@@ -1247,17 +1448,15 @@
             }
         }
 
-        // Update Game UI (improved)
+        // Update Multiplayer Game UI
         function updateGameUI(data) {
-            const alivePlayers = Object.values(data.players).filter(p => p.status === 'alive');
-            const aliveRealPlayers = alivePlayers.filter(p => !p.isNpc);
-            const aliveBots = alivePlayers.filter(p => p.isNpc);
+            const alivePlayers = Object.values(data.players).filter(p => p.status === 'alive' && !p.isNpc);
             const self = data.players[gameState.wallet];
             
-            document.getElementById('game-status').textContent = `⚡ ELIMINATION ROUND ${data.round} ⚡`;
+            document.getElementById('game-status').textContent = `⚡ MULTIPLAYER ROUND ${data.round} ⚡`;
             document.getElementById('players-info').textContent = `${alivePlayers.length} PLAYERS LEFT`;
             
-            console.log(`🎮 Round ${data.round}: ${aliveRealPlayers.length} real players, ${aliveBots.length} bots alive`);
+            console.log(`🎮 Multiplayer Round ${data.round}: ${alivePlayers.length} real players alive`);
             
             // Check if player has acted this round (don't override local state if processing)
             if (!gameState.isProcessing) {
@@ -1269,17 +1468,29 @@
             
             // Update button state based on current status
             if (gameState.hasActed || gameState.isProcessing) {
-                actionBtn.textContent = gameState.isProcessing ? '⚡ PROCESSING...' : '✅ SURVIVED THIS ROUND!';
+                actionBtn.textContent = gameState.isProcessing ? '⚡ PROCESSING...' : '⚡ ACTION RECORDED!';
                 actionBtn.disabled = true;
-                actionStatus.innerHTML = '<div class="success">Action recorded! Wait for round to end...</div>';
+                
+                // Show response time if available
+                if (self && self.responseTime) {
+                    actionStatus.innerHTML = `<div class="success">⚡ Response time: ${self.responseTime}ms - Waiting for round to end...</div>`;
+                } else {
+                    actionStatus.innerHTML = '<div class="success">Action recorded! Waiting for other players...</div>';
+                }
             } else if (self && self.status === 'alive') {
                 actionBtn.textContent = '🎯 CLICK TO SURVIVE!';
                 actionBtn.disabled = false;
-                actionStatus.innerHTML = '';
+                actionStatus.innerHTML = '<div style="color: #ffff00;">⚡ Be fast! Slowest player gets eliminated!</div>';
             } else {
                 actionBtn.textContent = '💀 ELIMINATED';
                 actionBtn.disabled = true;
-                actionStatus.innerHTML = '<div class="error">You have been eliminated!</div>';
+                
+                // Show elimination reason
+                if (self && self.responseTime) {
+                    actionStatus.innerHTML = `<div class="error">💀 Eliminated! Your response time: ${self.responseTime}ms</div>`;
+                } else {
+                    actionStatus.innerHTML = '<div class="error">💀 You have been eliminated!</div>';
+                }
             }
         }
 
@@ -1313,12 +1524,17 @@
             }
         }
 
-        // Play Again (improved cleanup)
+        // Play Again (multiplayer cleanup)
         function playAgain() {
-            // Clean up timers and listeners
+            // Clean up all timers and listeners
             if (currentTimerInterval) {
                 clearInterval(currentTimerInterval);
                 currentTimerInterval = null;
+            }
+            
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+                countdownInterval = null;
             }
             
             if (gameState.gameListener) {
@@ -1333,18 +1549,24 @@
             gameState.players = {};
             gameState.round = 0;
             gameState.isProcessing = false;
+            gameState.playerCount = 0;
+            gameState.maxPlayers = 5; // Default
             
             // Reset UI elements
             showError('');
-            document.querySelector('#lobby-section button').textContent = '⚡ JOIN GAME';
+            document.querySelector('#lobby-section button').textContent = '🎯 JOIN MULTIPLAYER GAME';
             document.querySelector('#lobby-section button').disabled = false;
+            
+            // Reset refund button
+            document.getElementById('refund-btn').textContent = '💰 LEAVE & GET REFUND';
+            document.getElementById('refund-btn').disabled = false;
             
             // Resume price updates
             startPriceUpdates();
             
             // Show lobby section
             showSection('lobby-section');
-            console.log('🔄 Game state reset for new game');
+            console.log('🔄 Multiplayer game state reset for new game');
         }
 
         // Disconnect Wallet (improved cleanup)
@@ -1399,7 +1621,7 @@
 
         // Utility Functions
         function showSection(sectionId) {
-            const sections = ['wallet-section', 'lobby-section', 'game-section', 'winner-section'];
+            const sections = ['wallet-section', 'lobby-section', 'waiting-section', 'game-section', 'winner-section'];
             sections.forEach(id => {
                 document.getElementById(id).classList.add('hidden');
             });

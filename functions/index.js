@@ -88,25 +88,42 @@ async function getGameConfig() {
         ballTokenMint: configData.prizeTokenMintAddress,
         entryFeeSol: configData.entryFee,
         maxPlayers: configData.maxPlayersPerGame || 5,
-        npcInGame: configData.npcInGame ?? true,
-        roundDurationSec: configData.roundDurationSec || 5,
-        isProduction: configData.isProduction ?? false,
+        roundDurationSec: configData.roundDurationSec || 8,
         tokenSymbol: configData.tokenSymbol,
         prizeTokenDecimals: configData.prizeTokenDecimals || 9
     };
 }
 
-// Join Lobby with SOL Payment Verification
-exports.joinLobby = functions.https.onCall(async (data, context) => {
+// Get next sequential game ID
+async function getNextGameId() {
+    const counterRef = db.collection('counters').doc('gameCounter');
+    
+    return db.runTransaction(async (transaction) => {
+        const counterDoc = await transaction.get(counterRef);
+        
+        let nextNumber = 1;
+        if (counterDoc.exists) {
+            nextNumber = (counterDoc.data().count || 0) + 1;
+        }
+        
+        transaction.set(counterRef, { count: nextNumber }, { merge: true });
+        return `lsdgame${nextNumber}`;
+    });
+}
+
+// Join Lobby with Multiplayer Logic
+exports.joinLobby = functions.runWith({
+    cors: true
+}).https.onCall(async (data, context) => {
     const { playerAddress, transactionSignature } = data;
     
     if (!playerAddress) {
-        throw new functions.https.HttpsError('invalid-argument', 'Player address and transaction signature required');
+        throw new functions.https.HttpsError('invalid-argument', 'Player address required');
     }
 
     try {
         const config = await getGameConfig();
-        console.log(`🎮 Player ${playerAddress} attempting to join lobby`);
+        console.log(`🎮 Player ${playerAddress} attempting to join multiplayer lobby`);
 
         const connection = new Connection(config.rpcUrl, 'confirmed');
         
@@ -159,7 +176,7 @@ exports.joinLobby = functions.https.onCall(async (data, context) => {
                 throw new functions.https.HttpsError('invalid-argument', 'Payment verification failed: ' + error.message);
             }
         } else {
-            // No transaction signature - just check balance for UI purposes
+            // No transaction signature - check balance and find/create lobby
             const playerPubkey = new PublicKey(playerAddress);
             const balance = await connection.getBalance(playerPubkey);
             const solBalance = balance / LAMPORTS_PER_SOL;
@@ -169,13 +186,57 @@ exports.joinLobby = functions.https.onCall(async (data, context) => {
                     `Insufficient SOL balance. Need ${config.entryFeeSol} SOL, have ${solBalance.toFixed(4)} SOL`);
             }
             
-            // Return payment instruction for frontend
+            // Check for existing lobbies that this player can join
+            console.log(`🔍 Checking for existing lobbies before payment`);
+            const existingLobbyQuery = db.collection('games')
+                .where('status', 'in', ['waiting', 'lobby'])
+                .orderBy('createdAt', 'asc')
+                .limit(1);
+            
+            const existingLobbies = await existingLobbyQuery.get();
+            console.log(`🔍 Found ${existingLobbies.size} existing lobbies before payment`);
+            
+            let targetGameId = null;
+            
+            if (!existingLobbies.empty) {
+                // Found existing lobby - return its ID for payment
+                targetGameId = existingLobbies.docs[0].id;
+                console.log(`🎯 Will join existing game: ${targetGameId}`);
+            } else {
+                // No existing lobby - create one now (without adding player yet)
+                targetGameId = await getNextGameId();
+                const gameRef = db.collection('games').doc(targetGameId);
+                
+                await gameRef.set({
+                    status: 'waiting',
+                    players: {},
+                    playerCount: 0,
+                    round: 0,
+                    roundStartedAt: null,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    totalSolCollected: 0,
+                    entryFeeSol: config.entryFeeSol,
+                    ballTokenMint: config.ballTokenMint,
+                    tokenSymbol: config.tokenSymbol,
+                    maxPlayers: config.maxPlayers,
+                    payments: [],
+                    countdownStartedAt: null,
+                    countdownDuration: 15
+                });
+                
+                console.log(`🆕 Created empty lobby: ${targetGameId} (waiting for payment)`);
+            }
+            
+            // Return payment instruction with target game ID
             return {
                 success: false,
                 requiresPayment: true,
                 entryFee: config.entryFeeSol,
                 treasuryAddress: config.treasuryWallet.publicKey.toString(),
-                message: `Please send ${config.entryFeeSol} SOL to join the game`
+                message: `Please send ${config.entryFeeSol} SOL to join game ${targetGameId}`,
+                targetGameId: targetGameId,
+                existingLobbies: existingLobbies.size
             };
         }
 
@@ -190,111 +251,136 @@ exports.joinLobby = functions.https.onCall(async (data, context) => {
         
         await db.collection('payments').add(paymentData);
 
-        // Find or create a lobby
+        // Find the specific lobby to join (should exist from first call)
+        console.log(`🔍 Looking for existing lobbies to join with payment`);
+        
+        // First check if this player is already in an active game
+        const playerGamesQuery = db.collection('games')
+            .where('status', 'in', ['waiting', 'lobby', 'starting', 'in_progress']);
+        
+        const playerGames = await playerGamesQuery.get();
+        const playerActiveGames = [];
+        for (const doc of playerGames.docs) {
+            const gameData = doc.data();
+            if (gameData.players && gameData.players[playerAddress]) {
+                playerActiveGames.push(doc.id);
+            }
+        }
+        
+        if (playerActiveGames.length > 0) {
+            console.log(`🔗 Player already in games: ${playerActiveGames.join(', ')}`);
+            throw new functions.https.HttpsError('already-exists', `You are already in game(s): ${playerActiveGames.join(', ')}. Please finish or leave those games first.`);
+        }
+        
+        // Find the oldest available lobby (first created)
         const existingLobbyQuery = db.collection('games')
-            .where('status', '==', 'lobby')
-            .where('isProduction', '==', config.isProduction)
+            .where('status', 'in', ['waiting', 'lobby'])
+            .orderBy('createdAt', 'asc')
             .limit(1);
         
         const existingLobbies = await existingLobbyQuery.get();
+        console.log(`🔍 Found ${existingLobbies.size} existing lobbies for payment`);
         
         let gameRef;
         let gameData;
+        let isNewGame = false;
         
         if (!existingLobbies.empty) {
             gameRef = existingLobbies.docs[0].ref;
             gameData = existingLobbies.docs[0].data();
-            console.log(`🔗 Joining existing lobby: ${gameRef.id}`);
+            console.log(`🔗 Joining existing lobby with payment: ${gameRef.id} (status: ${gameData.status}, players: ${gameData.playerCount})`);
         } else {
-            // Create new lobby
-            gameRef = db.collection('games').doc();
+            // This shouldn't happen since first call should create a lobby
+            console.log(`⚠️ No lobby found for payment - creating emergency lobby`);
+            const gameId = await getNextGameId();
+            gameRef = db.collection('games').doc(gameId);
             gameData = {
-                status: 'lobby',
+                status: 'waiting',
                 players: {},
                 playerCount: 0,
                 round: 0,
                 roundStartedAt: null,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                isProduction: config.isProduction,
                 totalSolCollected: 0,
                 entryFeeSol: config.entryFeeSol,
                 ballTokenMint: config.ballTokenMint,
                 tokenSymbol: config.tokenSymbol,
-                payments: []
+                maxPlayers: config.maxPlayers,
+                payments: [],
+                countdownStartedAt: null,
+                countdownDuration: 15
             };
-            console.log(`🆕 Creating new lobby: ${gameRef.id}`);
+            isNewGame = true;
+            console.log(`🆕 Emergency lobby creation: ${gameId}`);
         }
 
         let players = gameData?.players || {};
 
+        // Check if player already in game
+        if (players[playerAddress]) {
+            throw new functions.https.HttpsError('already-exists', 'Player already in this game');
+        }
+
         // Add the player
-        if (!players[playerAddress]) {
-            players[playerAddress] = {
-                address: playerAddress,
-                name: `Player ${playerAddress.slice(0, 4)}`,
-                status: 'alive',
-                isNpc: false,
-                lastActionRound: 0,
-                joinedAt: admin.firestore.FieldValue.serverTimestamp(),
-                solPaid: config.entryFeeSol,
-                transactionSignature: transactionSignature
-            };
-            console.log(`✅ Added player ${playerAddress} to lobby`);
-        }
+        players[playerAddress] = {
+            address: playerAddress,
+            name: `Player ${playerAddress.slice(0, 4)}`,
+            status: 'alive',
+            isNpc: false,
+            lastActionRound: 0,
+            joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+            solPaid: config.entryFeeSol,
+            transactionSignature: transactionSignature,
+            responseTime: null // Will track button press timing
+        };
+        console.log(`✅ Added player ${playerAddress} to lobby`);
 
-        // Add bots if enabled and needed
-        if (config.npcInGame) {
-            const currentPlayerCount = Object.keys(players).length;
-            const botsNeeded = config.maxPlayers - currentPlayerCount;
-            
-            console.log(`🤖 Adding ${botsNeeded} bots (npcInGame: ${config.npcInGame}, maxPlayers: ${config.maxPlayers})`);
-            
-            for (let i = 1; i <= botsNeeded; i++) {
-                const botId = `BOT_${i}_${Date.now()}`;
-                players[botId] = {
-                    address: botId,
-                    name: `Bot ${i}`,
-                    status: 'alive',
-                    isNpc: true,
-                    lastActionRound: 0,
-                    eliminationRound: i, // Bot 1 dies round 1, Bot 2 dies round 2, etc.
-                    solPaid: 0 // Bots don't pay
-                };
-            }
-        } else {
-            console.log(`🚫 No bots added (npcInGame: false)`);
-        }
+        const playerCount = Object.keys(players).length;
+        let newStatus = gameData.status;
+        let countdownStartedAt = gameData.countdownStartedAt;
+        let message = '';
 
-        const finalPlayerCount = Object.keys(players).length;
+        // Determine new game state
+        if (playerCount === 1) {
+            newStatus = 'waiting';
+            message = 'Waiting for more players to join...';
+        } else if (playerCount >= 2 && playerCount < config.maxPlayers) {
+            newStatus = 'lobby';
+            countdownStartedAt = admin.firestore.FieldValue.serverTimestamp();
+            message = `Game will start with ${playerCount}/${config.maxPlayers} players in 15 seconds. Countdown resets when new players join.`;
+        } else if (playerCount >= config.maxPlayers) {
+            newStatus = 'starting';
+            countdownStartedAt = null;
+            message = 'Game is full! Starting now - no refunds allowed.';
+        }
 
         // Update game data
         const updateData = {
             players: players,
-            playerCount: finalPlayerCount,
+            playerCount: playerCount,
+            status: newStatus,
             totalSolCollected: admin.firestore.FieldValue.increment(config.entryFeeSol),
             payments: admin.firestore.FieldValue.arrayUnion({
                 player: playerAddress,
                 signature: transactionSignature,
                 amount: config.entryFeeSol
             }),
+            countdownStartedAt: countdownStartedAt,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         };
 
-        // Start game when we reach max players OR when NPCs are disabled and we have at least 1 player
-        const shouldStartGame = config.npcInGame ? 
-            (finalPlayerCount >= config.maxPlayers) : 
-            (finalPlayerCount >= 1); // Start immediately if no NPCs
-            
-        if (shouldStartGame) {
-            console.log(`🚀 GAME START: ${finalPlayerCount} players (maxPlayers: ${config.maxPlayers}, npcInGame: ${config.npcInGame})`);
+        // Start game immediately if max players reached
+        if (playerCount >= config.maxPlayers) {
             Object.assign(updateData, {
                 status: 'in_progress',
                 round: 1,
                 roundStartedAt: admin.firestore.FieldValue.serverTimestamp()
             });
-        } else {
-            console.log(`⏳ Waiting for more players: ${finalPlayerCount}/${config.maxPlayers} (npcInGame: ${config.npcInGame})`);
+            
+            // Start background SOL to BALL swap for faster prize distribution
+            console.log(`🔄 Starting background SOL swap for game ${gameRef.id}`);
+            // Note: We'll implement this swap in the background
         }
 
         await gameRef.set(updateData, { merge: true });
@@ -302,9 +388,13 @@ exports.joinLobby = functions.https.onCall(async (data, context) => {
         return { 
             success: true, 
             gameId: gameRef.id,
-            message: finalPlayerCount >= config.maxPlayers ? 'Game starting now!' : `Waiting for ${config.maxPlayers - finalPlayerCount} more players`,
+            message: message,
             entryFee: config.entryFeeSol,
-            paymentVerified: true
+            paymentVerified: true,
+            playerCount: playerCount,
+            maxPlayers: config.maxPlayers,
+            status: newStatus,
+            isNewGame: isNewGame
         };
 
     } catch (error) {
@@ -313,9 +403,238 @@ exports.joinLobby = functions.https.onCall(async (data, context) => {
     }
 });
 
-// Player Action
-exports.playerAction = functions.https.onCall(async (data, context) => {
+// Clean up old/stale games
+exports.cleanupOldGames = functions.runWith({
+    cors: true
+}).https.onCall(async (data, context) => {
+    try {
+        const { playerAddress } = data;
+        
+        if (!playerAddress) {
+            throw new functions.https.HttpsError('invalid-argument', 'Player address is required');
+        }
+        
+        console.log(`🧹 Cleaning up old games for player: ${playerAddress}`);
+        
+        // Find all games where this player is present
+        const allGamesQuery = db.collection('games');
+        const allGames = await allGamesQuery.get();
+        
+        const gamesToClean = [];
+        const batch = db.batch();
+        
+        for (const doc of allGames.docs) {
+            const gameData = doc.data();
+            if (gameData.players && gameData.players[playerAddress]) {
+                // Check if game is old or in a state that should be cleaned
+                const gameAge = Date.now() - (gameData.createdAt?.toDate?.()?.getTime() || 0);
+                const isOld = gameAge > 10 * 60 * 1000; // 10 minutes old
+                const isStale = ['waiting', 'lobby'].includes(gameData.status) && isOld;
+                const isCompleted = gameData.status === 'completed';
+                
+                if (isStale || isCompleted) {
+                    console.log(`🗑️ Marking game ${doc.id} for cleanup (status: ${gameData.status}, age: ${Math.round(gameAge/1000)}s)`);
+                    gamesToClean.push(doc.id);
+                    
+                    // Remove player from game or delete entire game if empty
+                    const updatedPlayers = { ...gameData.players };
+                    delete updatedPlayers[playerAddress];
+                    
+                    const remainingPlayerCount = Object.keys(updatedPlayers).length;
+                    
+                    if (remainingPlayerCount === 0) {
+                        // Delete empty game
+                        batch.delete(doc.ref);
+                    } else {
+                        // Remove player from game
+                        batch.update(doc.ref, {
+                            players: updatedPlayers,
+                            playerCount: remainingPlayerCount,
+                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        });
+                    }
+                }
+            }
+        }
+        
+        if (gamesToClean.length > 0) {
+            await batch.commit();
+            console.log(`✅ Cleaned up ${gamesToClean.length} games: ${gamesToClean.join(', ')}`);
+        } else {
+            console.log(`✅ No games needed cleanup for player: ${playerAddress}`);
+        }
+        
+        return {
+            success: true,
+            cleanedGames: gamesToClean,
+            message: `Cleaned up ${gamesToClean.length} old/completed games`
+        };
+        
+    } catch (error) {
+        console.error('❌ Cleanup error:', error);
+        throw new functions.https.HttpsError('internal', `Failed to cleanup games: ${error.message}`);
+    }
+});
+
+// Request Refund (only allowed in waiting/lobby states)
+exports.requestRefund = functions.runWith({
+    cors: true
+}).https.onCall(async (data, context) => {
     const { gameId, playerAddress } = data;
+    
+    if (!gameId || !playerAddress) {
+        throw new functions.https.HttpsError('invalid-argument', 'Game ID and player address required');
+    }
+
+    try {
+        const config = await getGameConfig();
+        const gameRef = db.collection('games').doc(gameId);
+        const gameDoc = await gameRef.get();
+        
+        if (!gameDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Game not found');
+        }
+
+        const game = gameDoc.data();
+        
+        // Only allow refunds in waiting/lobby states
+        if (!['waiting', 'lobby'].includes(game.status)) {
+            throw new functions.https.HttpsError('failed-precondition', 'Refunds not allowed - game has started or is full');
+        }
+
+        let players = game.players || {};
+        const player = players[playerAddress];
+        
+        if (!player) {
+            throw new functions.https.HttpsError('not-found', 'Player not found in game');
+        }
+
+        // Calculate refund amount (minus 0.0005 SOL transfer fee)
+        const refundAmount = Math.max(0, player.solPaid - 0.0005);
+        
+        if (refundAmount <= 0) {
+            throw new functions.https.HttpsError('failed-precondition', 'Refund amount too small after fees');
+        }
+
+        // Remove player from game
+        delete players[playerAddress];
+        const newPlayerCount = Object.keys(players).length;
+        
+        // Determine new game state
+        let newStatus = game.status;
+        let countdownStartedAt = game.countdownStartedAt;
+        
+        if (newPlayerCount === 0) {
+            // No players left - game can be deleted or marked as cancelled
+            newStatus = 'cancelled';
+            countdownStartedAt = null;
+        } else if (newPlayerCount === 1) {
+            // Back to waiting for second player
+            newStatus = 'waiting';
+            countdownStartedAt = null;
+        } else if (newPlayerCount >= 2) {
+            // Reset countdown
+            newStatus = 'lobby';
+            countdownStartedAt = admin.firestore.FieldValue.serverTimestamp();
+        }
+
+        // Update game
+        await gameRef.update({
+            players: players,
+            playerCount: newPlayerCount,
+            status: newStatus,
+            countdownStartedAt: countdownStartedAt,
+            totalSolCollected: admin.firestore.FieldValue.increment(-player.solPaid),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Implement actual SOL refund transaction
+        try {
+            const connection = new Connection(config.rpcUrl, 'confirmed');
+            const { Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+            
+            // Create refund transaction
+            const refundLamports = Math.floor(refundAmount * LAMPORTS_PER_SOL);
+            const fromPubkey = config.treasuryWallet.publicKey;
+            const toPubkey = new PublicKey(playerAddress);
+            
+            const transaction = new Transaction().add(
+                SystemProgram.transfer({
+                    fromPubkey,
+                    toPubkey,
+                    lamports: refundLamports,
+                })
+            );
+            
+            // Get recent blockhash
+            const { blockhash } = await connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.feePayer = fromPubkey;
+            
+            // Sign and send transaction
+            transaction.sign(config.treasuryWallet);
+            const signature = await connection.sendRawTransaction(transaction.serialize());
+            
+            // Wait for confirmation
+            await connection.confirmTransaction(signature, 'confirmed');
+            
+            console.log(`💰 Refund sent: ${playerAddress} - ${refundAmount} SOL (${signature})`);
+            
+            // Record successful refund
+            await db.collection('refunds').add({
+                gameId: gameId,
+                playerAddress: playerAddress,
+                originalAmount: player.solPaid,
+                refundAmount: refundAmount,
+                transferFee: 0.0005,
+                status: 'completed',
+                transactionSignature: signature,
+                requestedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            
+            return { 
+                success: true, 
+                message: `Refund of ${refundAmount} SOL sent successfully!`,
+                refundAmount: refundAmount,
+                transactionSignature: signature,
+                newPlayerCount: newPlayerCount,
+                newStatus: newStatus
+            };
+            
+        } catch (refundError) {
+            console.error('❌ Refund transaction failed:', refundError);
+            
+            // Record failed refund but still remove player from game
+            await db.collection('refunds').add({
+                gameId: gameId,
+                playerAddress: playerAddress,
+                originalAmount: player.solPaid,
+                refundAmount: refundAmount,
+                transferFee: 0.0005,
+                status: 'failed',
+                error: refundError.message,
+                requestedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            
+            return { 
+                success: true, 
+                message: `Player removed from game, but refund transaction failed: ${refundError.message}`,
+                refundAmount: 0,
+                newPlayerCount: newPlayerCount,
+                newStatus: newStatus,
+                refundFailed: true
+            };
+        }
+
+    } catch (error) {
+        console.error('Refund request error:', error);
+        throw new functions.https.HttpsError('internal', 'Refund request failed: ' + error.message);
+    }
+});
+
+// Player Action with Response Time Tracking
+exports.playerAction = functions.https.onCall(async (data, context) => {
+    const { gameId, playerAddress, clientTimestamp } = data;
     
     if (!gameId || !playerAddress) {
         throw new functions.https.HttpsError('invalid-argument', 'Game ID and player address required');
@@ -342,25 +661,33 @@ exports.playerAction = functions.https.onCall(async (data, context) => {
             throw new functions.https.HttpsError('failed-precondition', 'Player not alive');
         }
 
-        // Record player action
+        // Calculate response time (time from round start to button press)
+        const now = admin.firestore.Timestamp.now();
+        const roundStartTime = game.roundStartedAt.toMillis();
+        const responseTimeMs = now.toMillis() - roundStartTime;
+        
+        // Record player action with response time
         players[playerAddress] = {
             ...player,
             lastActionRound: game.round,
-            lastActionAt: admin.firestore.FieldValue.serverTimestamp()
+            lastActionAt: now,
+            responseTime: responseTimeMs,
+            clientTimestamp: clientTimestamp || null
         };
 
-        console.log(`⚡ Player ${playerAddress} acted in round ${game.round}`);
+        console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - Response time: ${responseTimeMs}ms`);
 
         // Update game
         await gameRef.update({
             players: players,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            updatedAt: now
         });
 
         return { 
             success: true, 
             message: 'Action recorded',
-            round: game.round
+            round: game.round,
+            responseTime: responseTimeMs
         };
 
     } catch (error) {
@@ -374,8 +701,8 @@ async function processGameRounds() {
     const config = await getGameConfig();
     const now = admin.firestore.Timestamp.now();
     
-    // Get all active games
-    const activeGamesQuery = db.collection('games').where('status', '==', 'in_progress');
+    // Get all active games, lobby games with expired countdowns, and starting games
+    const activeGamesQuery = db.collection('games').where('status', 'in', ['in_progress', 'lobby', 'starting']);
     const activeGames = await activeGamesQuery.get();
 
     if (activeGames.empty) {
@@ -388,111 +715,165 @@ async function processGameRounds() {
         const game = doc.data();
         const gameRef = doc.ref;
         
-        // Check if round should end (with small buffer for instant processing)
-        const roundStartTime = game.roundStartedAt.toMillis();
-        const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
-        
-        if (elapsedSec >= config.roundDurationSec) {
-            console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
+        // Handle starting state - immediately transition to in_progress
+        if (game.status === 'starting') {
+            console.log(`🚀 Starting game ${doc.id} with ${game.playerCount} players`);
             
-            let players = { ...game.players };
-            
-            // Make bots act strategically
-            Object.keys(players).forEach(playerId => {
-                const player = players[playerId];
-                if (player.isNpc && player.status === 'alive') {
-                    // Check if this bot should be eliminated this round
-                    if (player.eliminationRound === game.round) {
-                        // Don't act - will be eliminated
-                        console.log(`🤖 Bot ${playerId} scheduled for elimination in round ${game.round}`);
-                    } else {
-                        // Act to survive
-                        players[playerId] = { ...player, lastActionRound: game.round };
-                    }
-                }
+            await gameRef.update({
+                status: 'in_progress',
+                round: 1,
+                roundStartedAt: now,
+                updatedAt: now
             });
-
-            // Eliminate players who didn't act
-            Object.keys(players).forEach(playerId => {
-                const player = players[playerId];
-                if (player.status === 'alive' && player.lastActionRound < game.round) {
-                    players[playerId] = { ...player, status: 'eliminated' };
-                    console.log(`💀 Eliminated ${playerId} in round ${game.round}`);
-                }
-            });
-
-            // Check for winner
-            const alivePlayers = Object.values(players).filter(p => p.status === 'alive');
-            
-            if (alivePlayers.length <= 1) {
-                // Game over - trigger Jupiter swap for winner
-                const winner = alivePlayers[0];
-                console.log(`🎉 Game ${doc.id} complete! Winner: ${winner?.address || 'None'}`);
-                
-                let prizeData = null;
-                if (winner && !winner.isNpc && game.totalSolCollected > 0) {
-                    try {
-                        // Perform Jupiter swap: SOL → BALL tokens
-                        console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
-                        const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
-                        
-                        if (swapResult.success) {
-                            // Transfer tokens to winner
-                            const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
-                            
-                            prizeData = {
-                                prizeAmountFormatted: (parseInt(swapResult.outputAmount) / Math.pow(10, config.prizeTokenDecimals)).toLocaleString(),
-                                tokenSymbol: config.tokenSymbol,
-                                rawAmount: parseInt(swapResult.outputAmount),
-                                solCollected: game.totalSolCollected,
-                                swapSignature: swapResult.signature,
-                                transferSignature: transferResult.signature || null,
-                                swapSuccess: true,
-                                transferSuccess: transferResult.success || false
-                            };
-                            
-                            if (!transferResult.success) {
-                                prizeData.transferError = transferResult.error;
-                            }
-                        } else {
-                            throw new Error(swapResult.error);
-                        }
-                    } catch (swapError) {
-                        console.error('Jupiter swap failed:', swapError);
-                        // Fallback: estimate tokens
-                        prizeData = {
-                            prizeAmountFormatted: (game.totalSolCollected * 1000000).toLocaleString(),
-                            tokenSymbol: config.tokenSymbol,
-                            rawAmount: game.totalSolCollected * 1000000,
-                            solCollected: game.totalSolCollected,
-                            swapFailed: true,
-                            error: swapError.message
-                        };
-                    }
-                }
-                
-                await gameRef.update({
-                    status: 'completed',
-                    winner: winner?.address || null,
-                    players: players,
-                    completedAt: now,
-                    updatedAt: now,
-                    prize: prizeData
-                });
-            } else {
-                // Next round
-                const nextRound = game.round + 1;
-                console.log(`➡️ Game ${doc.id} advancing to round ${nextRound}`);
-                
-                await gameRef.update({
-                    round: nextRound,
-                    roundStartedAt: now,
-                    players: players,
-                    updatedAt: now
-                });
-            }
             
             processedGames++;
+            continue;
+        }
+        
+        // Handle lobby countdown expiration
+        if (game.status === 'lobby' && game.countdownStartedAt) {
+            const countdownStartTime = game.countdownStartedAt.toMillis();
+            const countdownElapsed = (now.toMillis() - countdownStartTime) / 1000;
+            
+            if (countdownElapsed >= game.countdownDuration) {
+                console.log(`⏰ Lobby countdown expired for game ${doc.id} - Starting with ${game.playerCount} players`);
+                
+                // Start the game
+                await gameRef.update({
+                    status: 'in_progress',
+                    round: 1,
+                    roundStartedAt: now,
+                    countdownStartedAt: null,
+                    updatedAt: now
+                });
+                
+                processedGames++;
+                continue;
+            }
+        }
+        
+        // Handle active game rounds
+        if (game.status === 'in_progress' && game.roundStartedAt) {
+            const roundStartTime = game.roundStartedAt.toMillis();
+            const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
+            
+            if (elapsedSec >= config.roundDurationSec) {
+                console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
+                
+                let players = { ...game.players };
+                
+                // Get all alive players who acted this round
+                const alivePlayersWhoActed = Object.values(players).filter(p => 
+                    p.status === 'alive' && 
+                    p.lastActionRound === game.round &&
+                    !p.isNpc
+                );
+                
+                // Get all alive players who didn't act
+                const alivePlayersWhoDidntAct = Object.values(players).filter(p => 
+                    p.status === 'alive' && 
+                    p.lastActionRound < game.round &&
+                    !p.isNpc
+                );
+                
+                console.log(`📊 Round ${game.round} stats: ${alivePlayersWhoActed.length} acted, ${alivePlayersWhoDidntAct.length} didn't act`);
+                
+                // Eliminate players based on response time (slowest gets eliminated)
+                if (alivePlayersWhoActed.length > 1) {
+                    // Sort by response time (slowest first)
+                    alivePlayersWhoActed.sort((a, b) => (b.responseTime || 0) - (a.responseTime || 0));
+                    
+                    // Eliminate the slowest player
+                    const slowestPlayer = alivePlayersWhoActed[0];
+                    players[slowestPlayer.address] = { ...slowestPlayer, status: 'eliminated' };
+                    console.log(`🐌 Eliminated slowest player ${slowestPlayer.address} - Response time: ${slowestPlayer.responseTime}ms`);
+                } else if (alivePlayersWhoDidntAct.length > 0) {
+                    // Eliminate all players who didn't act
+                    alivePlayersWhoDidntAct.forEach(player => {
+                        players[player.address] = { ...player, status: 'eliminated' };
+                        console.log(`💀 Eliminated ${player.address} for not acting in round ${game.round}`);
+                    });
+                }
+                
+                // Check for winner
+                const alivePlayers = Object.values(players).filter(p => p.status === 'alive' && !p.isNpc);
+                
+                if (alivePlayers.length <= 1) {
+                    // Game over - trigger Jupiter swap for winner
+                    const winner = alivePlayers[0];
+                    console.log(`🎉 Multiplayer game ${doc.id} complete! Winner: ${winner?.address || 'None'}`);
+                    
+                    let prizeData = null;
+                    if (winner && game.totalSolCollected > 0) {
+                        try {
+                            // Perform Jupiter swap: SOL → BALL tokens
+                            console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
+                            const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
+                            
+                            if (swapResult.success) {
+                                // Transfer tokens to winner
+                                const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
+                                
+                                prizeData = {
+                                    prizeAmountFormatted: (parseInt(swapResult.outputAmount) / Math.pow(10, config.prizeTokenDecimals)).toLocaleString(),
+                                    tokenSymbol: config.tokenSymbol,
+                                    rawAmount: parseInt(swapResult.outputAmount),
+                                    solCollected: game.totalSolCollected,
+                                    swapSignature: swapResult.signature,
+                                    transferSignature: transferResult.signature || null,
+                                    swapSuccess: true,
+                                    transferSuccess: transferResult.success || false
+                                };
+                                
+                                if (!transferResult.success) {
+                                    prizeData.transferError = transferResult.error;
+                                }
+                            } else {
+                                throw new Error(swapResult.error);
+                            }
+                        } catch (swapError) {
+                            console.error('Jupiter swap failed:', swapError);
+                            // Fallback: estimate tokens
+                            prizeData = {
+                                prizeAmountFormatted: (game.totalSolCollected * 1000000).toLocaleString(),
+                                tokenSymbol: config.tokenSymbol,
+                                rawAmount: game.totalSolCollected * 1000000,
+                                solCollected: game.totalSolCollected,
+                                swapFailed: true,
+                                error: swapError.message
+                            };
+                        }
+                    }
+                    
+                    await gameRef.update({
+                        status: 'completed',
+                        winner: winner?.address || null,
+                        players: players,
+                        completedAt: now,
+                        updatedAt: now,
+                        prize: prizeData
+                    });
+                } else {
+                    // Next round - reset response times
+                    Object.keys(players).forEach(playerId => {
+                        if (players[playerId].status === 'alive') {
+                            players[playerId] = { ...players[playerId], responseTime: null };
+                        }
+                    });
+                    
+                    const nextRound = game.round + 1;
+                    console.log(`➡️ Multiplayer game ${doc.id} advancing to round ${nextRound} with ${alivePlayers.length} players`);
+                    
+                    await gameRef.update({
+                        round: nextRound,
+                        roundStartedAt: now,
+                        players: players,
+                        updatedAt: now
+                    });
+                }
+                
+                processedGames++;
+            }
         }
     }
 
@@ -504,6 +885,7 @@ async function processGameRounds() {
 }
 
 // Fast Game Tick for Real-time Processing (HTTPS Callable)
+// Fast Game Tick - Manual trigger
 exports.fastGameTick = functions.https.onCall(async (data, context) => {
     try {
         return await processGameRounds();
