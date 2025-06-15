@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🎮 CRYPTO ELIMINATION 🎮</title>
-    <!-- Cache buster: v1.1 -->
+    <!-- Cache buster: v1.2 -->
     <style>
         * {
             margin: 0;
@@ -230,8 +230,11 @@
                 <button class="action-btn" id="refund-btn" onclick="requestRefund()" style="background: linear-gradient(45deg, #ff4444, #ff0000);">
                     💰 LEAVE & GET REFUND
                 </button>
-                <button class="action-btn" id="cleanup-btn" onclick="cleanupOldGames()" style="background: linear-gradient(45deg, #ffaa00, #ff8800); margin-top: 10px;">
-                    🧹 CLEAN UP OLD GAMES
+                <button class="action-btn" id="force-start-btn" onclick="forceStartGame()" style="background: linear-gradient(45deg, #ff8800, #ffaa00);">
+                    🚀 FORCE START GAME
+                </button>
+                <button class="action-btn" id="cleanup-btn" onclick="cleanupOldGames()" style="background: linear-gradient(45deg, #8800ff, #aa00ff);">
+                    🧹 CLEANUP STUCK GAMES
                 </button>
                 <div id="refund-info" style="margin-top: 10px; color: #aaa; font-size: 0.8rem;">
                     Refund: Entry fee minus 0.0005 SOL transfer fee
@@ -794,13 +797,7 @@
                                          <span>${wallet.name}</span>
                                          <span class="wallet-install">Install</span>
                                      </div>
-                                     ${wallet.mobile ? `
-                                         <div class="wallet-option" onclick="testMobileLink('${wallet.name}')" style="margin-left: 20px; font-size: 0.8rem; opacity: 0.7;">
-                                             <span style="width: 24px; text-align: center;">📱</span>
-                                             <span>Test Mobile Link</span>
-                                             <span class="wallet-install">Debug</span>
-                                         </div>
-                                     ` : ''}
+                                     
                                  `).join('')}
                              </div>
                          ` : ''}
@@ -873,17 +870,7 @@
             }
         }
         
-        function testMobileLink(walletName) {
-            const wallet = availableWallets.find(w => w.name === walletName);
-            closeWalletModal();
-            
-            if (wallet.mobile) {
-                console.log(`🧪 Testing mobile link for ${walletName}: ${wallet.mobile}`);
-                // Open in new tab for testing
-                window.open(wallet.mobile, '_blank');
-                showError(`Testing mobile link for ${walletName}. Check console for URL.`);
-            }
-        }
+
         
         function createFallbackButton() {
             const walletContainer = document.getElementById('wallet-adapter-root');
@@ -1068,8 +1055,47 @@
             } catch (error) {
                 console.error('❌ Cleanup error:', error);
                 showError('Cleanup failed: ' + error.message);
-                document.getElementById('cleanup-btn').textContent = '🧹 CLEAN UP OLD GAMES';
+            } finally {
+                document.getElementById('cleanup-btn').textContent = '🧹 CLEANUP STUCK GAMES';
                 document.getElementById('cleanup-btn').disabled = false;
+            }
+        }
+
+        // Force start stuck game
+        async function forceStartGame() {
+            try {
+                if (!gameState.gameId) {
+                    showError('No active game to force start');
+                    return;
+                }
+                
+                showError('');
+                document.getElementById('force-start-btn').textContent = '⚡ FORCE STARTING...';
+                document.getElementById('force-start-btn').disabled = true;
+                
+                console.log('🚀 Force starting game:', gameState.gameId);
+                
+                const forceStartFunc = functions.httpsCallable('forceStartGame');
+                const result = await forceStartFunc({ 
+                    gameId: gameState.gameId
+                });
+                
+                console.log('✅ Force start result:', result.data);
+                
+                if (result.data.success) {
+                    showError(''); // Clear any errors
+                    document.getElementById('waiting-message').innerHTML = 
+                        `<div class="success">✅ ${result.data.message}</div>`;
+                } else {
+                    throw new Error(result.data.message || 'Force start failed');
+                }
+                
+            } catch (error) {
+                console.error('❌ Force start error:', error);
+                showError('Force start failed: ' + error.message);
+            } finally {
+                document.getElementById('force-start-btn').textContent = '🚀 FORCE START GAME';
+                document.getElementById('force-start-btn').disabled = false;
             }
         }
 
@@ -1291,9 +1317,10 @@
             }
         }
 
-        // SIMPLE HTML timer system - no backend dependency
+        // IMPROVED timer system - synchronized with backend
         let currentTimerInterval = null;
         let currentRoundNumber = null;
+        let roundStartTime = null; // Track when the round actually started
         
         function startTimer() {
             // Prevent duplicate timers for same round
@@ -1308,11 +1335,14 @@
                 currentTimerInterval = null;
             }
             
-            // Simple 5-second countdown - ignore backend timestamp
-            let timeLeft = 5;
+            // Record when this round started (client-side)
+            roundStartTime = Date.now();
+            
+            // Use 8-second countdown to match backend round duration
+            let timeLeft = 8;
             currentRoundNumber = gameState.round;
             
-            console.log(`⏰ Starting SIMPLE 5-second timer for round ${gameState.round}`);
+            console.log(`⏰ Starting 8-second timer for round ${gameState.round} at ${roundStartTime}`);
             
             document.getElementById('timer').textContent = timeLeft;
             
@@ -1326,12 +1356,10 @@
                     currentRoundNumber = null;
                     document.getElementById('timer').textContent = "TIME'S UP!";
                     
-                    console.log(`⏰ Round ${gameState.round} timer ended - processing with small delay for actions`);
+                    console.log(`⏰ Round ${gameState.round} timer ended - processing immediately`);
                     
-                    // Wait for backend round duration (8 seconds) plus buffer
-                    setTimeout(() => {
-                        processRoundEnd();
-                    }, 3500); // 3.5 second delay (5 + 3.5 = 8.5 seconds total)
+                    // Process round end immediately when timer expires
+                    processRoundEnd();
                 }
             }, 1000); // Update every second
         }
@@ -1373,7 +1401,7 @@
             }
         }
 
-        // Multiplayer player action with response time tracking
+        // Multiplayer player action with accurate response time tracking
         async function playerAction() {
             try {
                 // Prevent duplicate actions
@@ -1390,7 +1418,14 @@
                 }
                 
                 gameState.isProcessing = true;
-                const actionTime = Date.now(); // Record client-side action time
+                const actionTime = Date.now(); // Record exact click time
+                
+                // Calculate accurate response time from when the round started on this client
+                let clientResponseTime = null;
+                if (roundStartTime) {
+                    clientResponseTime = actionTime - roundStartTime;
+                    console.log(`⚡ Client-side response time: ${clientResponseTime}ms (clicked at ${actionTime}, round started at ${roundStartTime})`);
+                }
                 
                 // INSTANT visual feedback
                 const actionBtn = document.getElementById('action-btn');
@@ -1398,26 +1433,35 @@
                 
                 actionBtn.disabled = true;
                 actionBtn.textContent = '⚡ ACTION RECORDED!';
-                actionStatus.innerHTML = '<div class="success">🎯 Response recorded! Waiting for other players...</div>';
+                
+                // Show client-side response time immediately
+                if (clientResponseTime !== null) {
+                    actionStatus.innerHTML = `<div class="success">⚡ Response time: ${clientResponseTime}ms - Confirming with server...</div>`;
+                } else {
+                    actionStatus.innerHTML = '<div class="success">🎯 Response recorded! Confirming with server...</div>';
+                }
                 
                 // Set local state immediately for instant response
                 gameState.hasActed = true;
                 
                 console.log(`🎯 Multiplayer action for round ${gameState.round} at ${actionTime}...`);
                 
-                // Send action to backend with client timestamp for response time calculation
+                // Send action to backend with both timestamps
                 const playerActionFunc = functions.httpsCallable('playerAction');
                 try {
                     const result = await playerActionFunc({
                         gameId: gameState.gameId,
                         playerAddress: gameState.wallet,
-                        clientTimestamp: actionTime
+                        clientTimestamp: actionTime,
+                        clientResponseTime: clientResponseTime, // Send our calculated response time
+                        roundStartTime: roundStartTime // Send when we think the round started
                     });
                     
-                    console.log(`✅ Action confirmed - Response time: ${result.data.responseTime}ms`);
+                    console.log(`✅ Action confirmed - Server response time: ${result.data.responseTime}ms, Client response time: ${clientResponseTime}ms`);
                     
-                    // Update UI with response time
-                    actionStatus.innerHTML = `<div class="success">⚡ Response time: ${result.data.responseTime}ms - Waiting for round to end...</div>`;
+                    // Show the more accurate client-side response time
+                    const displayTime = clientResponseTime !== null ? clientResponseTime : result.data.responseTime;
+                    actionStatus.innerHTML = `<div class="success">⚡ Response time: ${displayTime}ms - Waiting for round to end...</div>`;
                     
                 } catch (error) {
                     console.error('❌ Backend action failed:', error);
@@ -1502,18 +1546,27 @@
             
             if (winner === gameState.wallet) {
                 winnerText.textContent = '🎉 YOU WON! 🎉';
-                if (gameData.prize) {
+                
+                // Check if prize data exists in the game data
+                if (gameData && gameData.prize) {
+                    const prize = gameData.prize;
                     prizeInfo.innerHTML = `
                         <div style="font-size: 1.5rem; margin: 10px 0;">
-                            🏀 Prize: ${gameData.prize.prizeAmountFormatted} $${gameData.prize.tokenSymbol}
+                            🏆 Prize: ${prize.prizeAmountFormatted} ${prize.tokenSymbol}
                         </div>
                         <div style="font-size: 0.9rem; color: #aaa; margin: 5px 0;">
-                            (${gameData.prize.solCollected} SOL collected & swapped)
+                            (${prize.solCollected} SOL collected & swapped)
                         </div>
                         <div>Congratulations! You survived all rounds!</div>
                     `;
                 } else {
-                    prizeInfo.textContent = 'Congratulations! You survived all rounds!';
+                    // Fallback if no prize data
+                    prizeInfo.innerHTML = `
+                        <div style="font-size: 1.2rem; margin: 10px 0;">
+                            🏆 Congratulations! You won the game!
+                        </div>
+                        <div>Prize tokens have been sent to your wallet!</div>
+                    `;
                 }
             } else {
                 winnerText.textContent = '💀 GAME OVER 💀';

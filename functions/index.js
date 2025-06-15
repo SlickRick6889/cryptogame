@@ -112,7 +112,7 @@ async function getNextGameId() {
 }
 
 // Join Lobby with Multiplayer Logic
-exports.joinLobby = functions.runWith({
+exports.joinLobby = functions.region('us-central1').runWith({
     cors: true
 }).https.onCall(async (data, context) => {
     const { playerAddress, transactionSignature } = data;
@@ -332,7 +332,8 @@ exports.joinLobby = functions.runWith({
             joinedAt: admin.firestore.FieldValue.serverTimestamp(),
             solPaid: config.entryFeeSol,
             transactionSignature: transactionSignature,
-            responseTime: null // Will track button press timing
+            responseTime: null, // Will track button press timing
+            refundRequested: false // Track if player requested refund
         };
         console.log(`✅ Added player ${playerAddress} to lobby`);
 
@@ -404,7 +405,7 @@ exports.joinLobby = functions.runWith({
 });
 
 // Clean up old/stale games
-exports.cleanupOldGames = functions.runWith({
+exports.cleanupOldGames = functions.region('us-central1').runWith({
     cors: true
 }).https.onCall(async (data, context) => {
     try {
@@ -476,8 +477,57 @@ exports.cleanupOldGames = functions.runWith({
     }
 });
 
-// Request Refund (only allowed in waiting/lobby states)
-exports.requestRefund = functions.runWith({
+// Force start stuck games
+exports.forceStartGame = functions.region('us-central1').https.onCall(async (data, context) => {
+    try {
+        const { gameId } = data;
+        
+        if (!gameId) {
+            throw new functions.https.HttpsError('invalid-argument', 'Game ID is required');
+        }
+        
+        console.log(`🚀 Force starting game: ${gameId}`);
+        
+        const gameRef = db.collection('games').doc(gameId);
+        const gameDoc = await gameRef.get();
+        
+        if (!gameDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Game not found');
+        }
+        
+        const gameData = gameDoc.data();
+        
+        if (gameData.status === 'in_progress' || gameData.status === 'completed') {
+            return {
+                success: false,
+                message: `Game is already ${gameData.status}`
+            };
+        }
+        
+        // Force start the game
+        await gameRef.update({
+            status: 'in_progress',
+            round: 1,
+            roundStartedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        console.log(`✅ Force started game ${gameId}`);
+        
+        return {
+            success: true,
+            message: `Game ${gameId} force started`,
+            gameId: gameId
+        };
+        
+    } catch (error) {
+        console.error('❌ Force start error:', error);
+        throw new functions.https.HttpsError('internal', 'Force start failed: ' + error.message);
+    }
+});
+
+// Simple Refund System - exactly as requested
+exports.requestRefund = functions.region('us-central1').runWith({
     cors: true
 }).https.onCall(async (data, context) => {
     const { gameId, playerAddress } = data;
@@ -487,6 +537,8 @@ exports.requestRefund = functions.runWith({
     }
 
     try {
+        console.log(`💰 Processing refund request for ${playerAddress} in game ${gameId}`);
+        
         const config = await getGameConfig();
         const gameRef = db.collection('games').doc(gameId);
         const gameDoc = await gameRef.get();
@@ -497,9 +549,9 @@ exports.requestRefund = functions.runWith({
 
         const game = gameDoc.data();
         
-        // Only allow refunds in waiting/lobby states
+        // Only allow refunds in waiting/lobby states (before game starts)
         if (!['waiting', 'lobby'].includes(game.status)) {
-            throw new functions.https.HttpsError('failed-precondition', 'Refunds not allowed - game has started or is full');
+            throw new functions.https.HttpsError('failed-precondition', 'Refunds not allowed - game has already started');
         }
 
         let players = game.players || {};
@@ -509,36 +561,69 @@ exports.requestRefund = functions.runWith({
             throw new functions.https.HttpsError('not-found', 'Player not found in game');
         }
 
-        // Calculate refund amount (minus 0.0005 SOL transfer fee)
-        const refundAmount = Math.max(0, player.solPaid - 0.0005);
-        
-        if (refundAmount <= 0) {
-            throw new functions.https.HttpsError('failed-precondition', 'Refund amount too small after fees');
+        if (player.refundRequested) {
+            throw new functions.https.HttpsError('already-exists', 'Refund already requested for this player');
         }
 
-        // Remove player from game
+        // Step 1: Mark refund as requested
+        players[playerAddress].refundRequested = true;
+        
+        // Step 2: Calculate refund amount (solPaid - 0.0005 fee)
+        const refundAmount = player.solPaid - 0.0005; // 0.01 - 0.0005 = 0.0095
+        
+        if (refundAmount <= 0) {
+            throw new functions.https.HttpsError('failed-precondition', 'Refund amount too small after transfer fee');
+        }
+
+        console.log(`💰 Refunding ${refundAmount} SOL to ${playerAddress} (original: ${player.solPaid}, fee: 0.0005)`);
+
+        // Step 3: Send SOL refund from treasury wallet to player
+        const connection = new Connection(config.rpcUrl, 'confirmed');
+        const { Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+        
+        const refundLamports = Math.floor(refundAmount * LAMPORTS_PER_SOL);
+        const fromPubkey = config.treasuryWallet.publicKey;
+        const toPubkey = new PublicKey(playerAddress);
+        
+        const transaction = new Transaction().add(
+            SystemProgram.transfer({
+                fromPubkey,
+                toPubkey,
+                lamports: refundLamports,
+            })
+        );
+        
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = fromPubkey;
+        
+        // Sign and send refund transaction
+        transaction.sign(config.treasuryWallet);
+        const refundSignature = await connection.sendRawTransaction(transaction.serialize());
+        await connection.confirmTransaction(refundSignature, 'confirmed');
+        
+        console.log(`✅ Refund transaction confirmed: ${refundSignature}`);
+
+        // Step 4: Remove player from game (4 players → 3 players)
         delete players[playerAddress];
         const newPlayerCount = Object.keys(players).length;
         
-        // Determine new game state
+        // Step 5: Update game state based on remaining players
         let newStatus = game.status;
         let countdownStartedAt = game.countdownStartedAt;
         
         if (newPlayerCount === 0) {
-            // No players left - game can be deleted or marked as cancelled
             newStatus = 'cancelled';
             countdownStartedAt = null;
         } else if (newPlayerCount === 1) {
-            // Back to waiting for second player
             newStatus = 'waiting';
             countdownStartedAt = null;
         } else if (newPlayerCount >= 2) {
-            // Reset countdown
             newStatus = 'lobby';
-            countdownStartedAt = admin.firestore.FieldValue.serverTimestamp();
+            countdownStartedAt = admin.firestore.FieldValue.serverTimestamp(); // Reset countdown
         }
 
-        // Update game
+        // Step 6: Update game in Firestore
         await gameRef.update({
             players: players,
             playerCount: newPlayerCount,
@@ -548,93 +633,26 @@ exports.requestRefund = functions.runWith({
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Implement actual SOL refund transaction
-        try {
-            const connection = new Connection(config.rpcUrl, 'confirmed');
-            const { Transaction, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-            
-            // Create refund transaction
-            const refundLamports = Math.floor(refundAmount * LAMPORTS_PER_SOL);
-            const fromPubkey = config.treasuryWallet.publicKey;
-            const toPubkey = new PublicKey(playerAddress);
-            
-            const transaction = new Transaction().add(
-                SystemProgram.transfer({
-                    fromPubkey,
-                    toPubkey,
-                    lamports: refundLamports,
-                })
-            );
-            
-            // Get recent blockhash
-            const { blockhash } = await connection.getLatestBlockhash();
-            transaction.recentBlockhash = blockhash;
-            transaction.feePayer = fromPubkey;
-            
-            // Sign and send transaction
-            transaction.sign(config.treasuryWallet);
-            const signature = await connection.sendRawTransaction(transaction.serialize());
-            
-            // Wait for confirmation
-            await connection.confirmTransaction(signature, 'confirmed');
-            
-            console.log(`💰 Refund sent: ${playerAddress} - ${refundAmount} SOL (${signature})`);
-            
-            // Record successful refund
-            await db.collection('refunds').add({
-                gameId: gameId,
-                playerAddress: playerAddress,
-                originalAmount: player.solPaid,
-                refundAmount: refundAmount,
-                transferFee: 0.0005,
-                status: 'completed',
-                transactionSignature: signature,
-                requestedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            
-            return { 
-                success: true, 
-                message: `Refund of ${refundAmount} SOL sent successfully!`,
-                refundAmount: refundAmount,
-                transactionSignature: signature,
-                newPlayerCount: newPlayerCount,
-                newStatus: newStatus
-            };
-            
-        } catch (refundError) {
-            console.error('❌ Refund transaction failed:', refundError);
-            
-            // Record failed refund but still remove player from game
-            await db.collection('refunds').add({
-                gameId: gameId,
-                playerAddress: playerAddress,
-                originalAmount: player.solPaid,
-                refundAmount: refundAmount,
-                transferFee: 0.0005,
-                status: 'failed',
-                error: refundError.message,
-                requestedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            
-            return { 
-                success: true, 
-                message: `Player removed from game, but refund transaction failed: ${refundError.message}`,
-                refundAmount: 0,
-                newPlayerCount: newPlayerCount,
-                newStatus: newStatus,
-                refundFailed: true
-            };
-        }
+        console.log(`✅ Player removed from game. New player count: ${newPlayerCount}, Status: ${newStatus}`);
+
+        return { 
+            success: true, 
+            message: `Refund successful! ${refundAmount} SOL sent to your wallet.`,
+            refundAmount: refundAmount,
+            refundSignature: refundSignature,
+            newPlayerCount: newPlayerCount,
+            newStatus: newStatus
+        };
 
     } catch (error) {
-        console.error('Refund request error:', error);
-        throw new functions.https.HttpsError('internal', 'Refund request failed: ' + error.message);
+        console.error('❌ Refund error:', error);
+        throw new functions.https.HttpsError('internal', `Refund failed: ${error.message}`);
     }
 });
 
-// Player Action with Response Time Tracking
-exports.playerAction = functions.https.onCall(async (data, context) => {
-    const { gameId, playerAddress, clientTimestamp } = data;
+// Player Action with Accurate Response Time Tracking
+exports.playerAction = functions.region('us-central1').https.onCall(async (data, context) => {
+    const { gameId, playerAddress, clientTimestamp, clientResponseTime, roundStartTime } = data;
     
     if (!gameId || !playerAddress) {
         throw new functions.https.HttpsError('invalid-argument', 'Game ID and player address required');
@@ -661,10 +679,19 @@ exports.playerAction = functions.https.onCall(async (data, context) => {
             throw new functions.https.HttpsError('failed-precondition', 'Player not alive');
         }
 
-        // Calculate response time (time from round start to button press)
         const now = admin.firestore.Timestamp.now();
-        const roundStartTime = game.roundStartedAt.toMillis();
-        const responseTimeMs = now.toMillis() - roundStartTime;
+        
+        // Use client-side response time if available (more accurate), otherwise calculate server-side
+        let responseTimeMs;
+        if (clientResponseTime !== null && clientResponseTime !== undefined) {
+            responseTimeMs = clientResponseTime;
+            console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - Client response time: ${responseTimeMs}ms`);
+        } else {
+            // Fallback to server-side calculation
+            const roundStartTimeMs = game.roundStartedAt.toMillis();
+            responseTimeMs = now.toMillis() - roundStartTimeMs;
+            console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - Server response time: ${responseTimeMs}ms`);
+        }
         
         // Record player action with response time
         players[playerAddress] = {
@@ -672,10 +699,10 @@ exports.playerAction = functions.https.onCall(async (data, context) => {
             lastActionRound: game.round,
             lastActionAt: now,
             responseTime: responseTimeMs,
-            clientTimestamp: clientTimestamp || null
+            clientTimestamp: clientTimestamp || null,
+            clientResponseTime: clientResponseTime || null,
+            clientRoundStartTime: roundStartTime || null
         };
-
-        console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - Response time: ${responseTimeMs}ms`);
 
         // Update game
         await gameRef.update({
@@ -811,12 +838,22 @@ async function processGameRounds() {
                             const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
                             
                             if (swapResult.success) {
+                                // Get connection for token decimals lookup
+                                const connection = new Connection(config.rpcUrl, 'confirmed');
+                                
+                                // Automatically detect token decimals from the blockchain
+                                const tokenDecimals = await getTokenDecimals(connection, config.ballTokenMint);
+                                
                                 // Transfer tokens to winner
                                 const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
                                 
-                                // Jupiter returns the actual token amount (not in smallest units)
+                                // Jupiter returns the actual token amount (in smallest units)
                                 const actualTokenAmount = parseInt(swapResult.outputAmount);
-                                const formattedAmount = (actualTokenAmount / Math.pow(10, config.prizeTokenDecimals)).toFixed(2);
+                                
+                                // Calculate formatted amount using detected decimals
+                                const formattedAmount = (actualTokenAmount / Math.pow(10, tokenDecimals)).toFixed(2);
+                                
+                                console.log(`💰 Prize calculation: ${actualTokenAmount} raw tokens / 10^${tokenDecimals} = ${formattedAmount} ${config.tokenSymbol}`);
                                 
                                 prizeData = {
                                     prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
@@ -827,7 +864,9 @@ async function processGameRounds() {
                                     transferSignature: transferResult.signature || null,
                                     swapSuccess: true,
                                     transferSuccess: transferResult.success || false,
-                                    jupiterQuoteAmount: swapResult.outputAmount // Store original for debugging
+                                    jupiterQuoteAmount: swapResult.outputAmount, // Store original for debugging
+                                    tokenDecimals: tokenDecimals, // Store detected decimals
+                                    tokenMint: config.ballTokenMint // Store mint for debugging
                                 };
                                 
                                 if (!transferResult.success) {
@@ -849,6 +888,9 @@ async function processGameRounds() {
                             };
                         }
                     }
+                    
+                    // Debug logging for prize data
+                    console.log(`🏆 Setting prize data for game ${doc.id}:`, JSON.stringify(prizeData, null, 2));
                     
                     await gameRef.update({
                         status: 'completed',
@@ -891,7 +933,7 @@ async function processGameRounds() {
 
 // Fast Game Tick for Real-time Processing (HTTPS Callable)
 // Fast Game Tick - Manual trigger
-exports.fastGameTick = functions.https.onCall(async (data, context) => {
+exports.fastGameTick = functions.region('us-central1').https.onCall(async (data, context) => {
     try {
         return await processGameRounds();
     } catch (error) {
@@ -1021,15 +1063,40 @@ async function getTokenProgramId(connection, tokenMint) {
     try {
         const mintInfo = await connection.getAccountInfo(new PublicKey(tokenMint));
         if (mintInfo?.owner.equals(TOKEN_2022_PROGRAM_ID)) {
-            console.log('🔍 Detected Token2022 program for BALL token');
+            console.log('🔍 Detected Token2022 program for token');
             return TOKEN_2022_PROGRAM_ID;
         } else {
-            console.log('🔍 Detected legacy SPL Token program for BALL token');
+            console.log('🔍 Detected legacy SPL Token program for token');
             return TOKEN_PROGRAM_ID;
         }
     } catch (error) {
         console.log('⚠️ Could not detect token program, defaulting to SPL Token');
         return TOKEN_PROGRAM_ID;
+    }
+}
+
+// Helper function to get token decimals from mint account
+async function getTokenDecimals(connection, tokenMint) {
+    try {
+        console.log(`🔍 Getting decimals for token: ${tokenMint}`);
+        const mintPubkey = new PublicKey(tokenMint);
+        const mintInfo = await connection.getAccountInfo(mintPubkey);
+        
+        if (!mintInfo) {
+            console.log('⚠️ Token mint account not found, defaulting to 6 decimals');
+            return 6;
+        }
+        
+        // Parse mint data to get decimals
+        // For both SPL Token and Token2022, decimals is at byte offset 44
+        const decimals = mintInfo.data[44];
+        console.log(`✅ Token ${tokenMint} has ${decimals} decimals`);
+        return decimals;
+        
+    } catch (error) {
+        console.error('❌ Error getting token decimals:', error);
+        console.log('⚠️ Defaulting to 6 decimals (USDC standard)');
+        return 6; // Default to USDC standard
     }
 }
 
@@ -1046,15 +1113,16 @@ function formatTokenAmount(rawAmount, decimals = 9) {
 // Transfer tokens to winner
 async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     try {
-        const formattedAmount = formatTokenAmount(tokenAmount);
-        console.log(`🏆 Distributing ${formattedAmount} BALL tokens (${tokenAmount} raw) to winner: ${winnerAddress}`);
-        
         const connection = new Connection(config.rpcUrl, 'confirmed');
         const winnerPubkey = new PublicKey(winnerAddress);
         const tokenMintPubkey = new PublicKey(config.ballTokenMint);
         
-        // Detect the correct token program
+        // Detect the correct token program and decimals
         const tokenProgramId = await getTokenProgramId(connection, config.ballTokenMint);
+        const tokenDecimals = await getTokenDecimals(connection, config.ballTokenMint);
+        
+        const formattedAmount = formatTokenAmount(tokenAmount, tokenDecimals);
+        console.log(`🏆 Distributing ${formattedAmount} ${config.tokenSymbol} tokens (${tokenAmount} raw) to winner: ${winnerAddress}`);
         
         // Get associated token accounts with correct program
         const treasuryTokenAccount = await getAssociatedTokenAddress(
@@ -1097,7 +1165,7 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
                     winnerTokenAccount, // to
                     config.treasuryWallet.publicKey, // owner
                     tokenAmount, // amount
-                    9, // decimals (BALL token has 9 decimals)
+                    tokenDecimals, // decimals (detected from mint)
                     [], // multiSigners
                     tokenProgramId // programId
                 )
