@@ -224,6 +224,9 @@
                 <div id="waiting-info" style="margin: 20px 0; color: #00ffff;">
                     <div id="game-id-display" style="font-size: 1.2rem; margin-bottom: 10px;"></div>
                     <div id="player-count-display" style="font-size: 1.1rem; margin-bottom: 15px;"></div>
+                    <div id="current-pot-display" style="font-size: 1.3rem; color: #14f195; margin: 10px 0; font-weight: bold;">
+                        💰 Current Pot: Loading...
+                    </div>
                     <div id="countdown-display" style="font-size: 2rem; color: #ff0000; margin: 15px 0;"></div>
                     <div id="waiting-message" style="color: #aaa; font-size: 0.9rem;"></div>
                 </div>
@@ -1251,6 +1254,9 @@
             document.getElementById('countdown-display').textContent = '';
             document.getElementById('waiting-message').textContent = 'Waiting for at least one more player to join...';
             
+            // Update current pot display
+            updateCurrentPot(data.playerCount);
+            
             // Show refund button
             document.getElementById('refund-btn').style.display = 'inline-block';
         }
@@ -1261,6 +1267,9 @@
             document.getElementById('game-id-display').textContent = `Game: ${gameState.gameId}`;
             document.getElementById('player-count-display').textContent = `${data.playerCount}/${gameState.maxPlayers} players ready`;
             document.getElementById('waiting-message').textContent = 'Countdown resets when new players join. Leave now for refund!';
+            
+            // Update current pot display
+            updateCurrentPot(data.playerCount);
             
             // Show refund button
             document.getElementById('refund-btn').style.display = 'inline-block';
@@ -1273,6 +1282,9 @@
             document.getElementById('player-count-display').textContent = `${data.playerCount}/${gameState.maxPlayers} players - FULL!`;
             document.getElementById('countdown-display').textContent = 'STARTING...';
             document.getElementById('waiting-message').textContent = 'Game is full! No refunds allowed.';
+            
+            // Update current pot display
+            updateCurrentPot(data.playerCount);
             
             // Hide refund button
             document.getElementById('refund-btn').style.display = 'none';
@@ -1300,11 +1312,9 @@
                     document.getElementById('countdown-display').textContent = 'STARTING...';
                     stopCountdown();
                     
-                    // Automatically trigger game start when countdown ends
-                    console.log('⏰ Countdown ended - triggering game start');
-                    setTimeout(() => {
-                        triggerGameTick();
-                    }, 500); // Small delay to ensure UI updates
+                    // Immediately trigger game start when countdown ends
+                    console.log('⏰ Countdown ended - triggering immediate game start');
+                    triggerGameTick(); // No delay - immediate start
                 }
             }, 100); // Update every 100ms for smooth countdown
         }
@@ -1314,6 +1324,52 @@
             if (countdownInterval) {
                 clearInterval(countdownInterval);
                 countdownInterval = null;
+            }
+        }
+
+        // Update current pot display with live Jupiter quote
+        async function updateCurrentPot(playerCount) {
+            if (!gameConfig || playerCount < 1) {
+                document.getElementById('current-pot-display').textContent = '💰 Current Pot: Loading...';
+                return;
+            }
+
+            try {
+                const totalSol = gameConfig.entryFee * playerCount;
+                console.log(`💰 Getting pot quote for ${playerCount} players (${totalSol} SOL)`);
+
+                // Get Jupiter quote for current pot
+                const lamports = Math.floor(totalSol * 1000000000); // Convert SOL to lamports
+                const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${gameConfig.prizeTokenMintAddress}&amount=${lamports}&slippageBps=300`;
+                
+                const response = await fetch(quoteUrl);
+                const quote = await response.json();
+                
+                if (quote && quote.outAmount) {
+                    // Get token decimals (we can cache this)
+                    let tokenDecimals = 6; // Default for USDC
+                    if (gameConfig.prizeTokenDecimals) {
+                        tokenDecimals = gameConfig.prizeTokenDecimals;
+                    }
+                    
+                    // Calculate formatted amount
+                    const tokenAmount = parseInt(quote.outAmount);
+                    const formattedAmount = (tokenAmount / Math.pow(10, tokenDecimals)).toFixed(2);
+                    const displayAmount = parseFloat(formattedAmount).toLocaleString();
+                    
+                    document.getElementById('current-pot-display').innerHTML = 
+                        `💰 Current Pot: <span style="color: #00ffff;">${displayAmount} ${gameConfig.tokenSymbol}</span>`;
+                    
+                    console.log(`💰 Pot updated: ${totalSol} SOL → ${displayAmount} ${gameConfig.tokenSymbol}`);
+                } else {
+                    throw new Error('No quote received');
+                }
+                
+            } catch (error) {
+                console.error('❌ Error updating pot:', error);
+                const totalSol = gameConfig.entryFee * playerCount;
+                document.getElementById('current-pot-display').innerHTML = 
+                    `💰 Current Pot: <span style="color: #00ffff;">${totalSol} SOL</span>`;
             }
         }
 
@@ -1338,11 +1394,11 @@
             // Record when this round started (client-side)
             roundStartTime = Date.now();
             
-            // Use 8-second countdown to match backend round duration
-            let timeLeft = 8;
+            // Use 5-second countdown to match backend round duration
+            let timeLeft = 5;
             currentRoundNumber = gameState.round;
             
-            console.log(`⏰ Starting 8-second timer for round ${gameState.round} at ${roundStartTime}`);
+            console.log(`⏰ Starting 5-second timer for round ${gameState.round} at ${roundStartTime}`);
             
             document.getElementById('timer').textContent = timeLeft;
             
@@ -1356,10 +1412,10 @@
                     currentRoundNumber = null;
                     document.getElementById('timer').textContent = "TIME'S UP!";
                     
-                    console.log(`⏰ Round ${gameState.round} timer ended - processing immediately`);
+                    console.log(`⏰ Round ${gameState.round} timer ended - waiting for backend processing`);
                     
-                    // Process round end immediately when timer expires
-                    processRoundEnd();
+                    // Don't trigger processing - let backend handle it after 7 seconds
+                    console.log(`⏰ Timer ended - backend will process after 7 seconds total`);
                 }
             }, 1000); // Update every second
         }
@@ -1697,6 +1753,15 @@
             setTimeout(() => {
                 initializeWalletAdapter();
             }, 1000);
+            
+            // Start automatic game tick every 3 seconds to process rounds
+            setInterval(async () => {
+                try {
+                    await firebase.functions().httpsCallable('fastGameTick')();
+                } catch (error) {
+                    // Ignore errors - this is just a background tick
+                }
+            }, 3000);
             
             // Wallet adapter will handle auto-connection
             console.log('🔗 Wallet adapter will handle auto-connection if available');

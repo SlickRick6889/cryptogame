@@ -1,5 +1,8 @@
 {
   "projects": {
-    "default": "website-6889"
-  }
+    "default": "website-6889",
+    "game": "website-6889"
+  },
+  "targets": {},
+  "etags": {}
 }

@@ -88,7 +88,7 @@ async function getGameConfig() {
         ballTokenMint: configData.prizeTokenMintAddress,
         entryFeeSol: configData.entryFee,
         maxPlayers: configData.maxPlayersPerGame || 5,
-        roundDurationSec: configData.roundDurationSec || 8,
+        roundDurationSec: configData.roundDurationSec || 5,
         tokenSymbol: configData.tokenSymbol,
         prizeTokenDecimals: configData.prizeTokenDecimals || 9
     };
@@ -784,7 +784,8 @@ async function processGameRounds() {
             const roundStartTime = game.roundStartedAt.toMillis();
             const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
             
-            if (elapsedSec >= config.roundDurationSec) {
+            // Add 2-second buffer for player actions to be submitted
+            if (elapsedSec >= (config.roundDurationSec + 2)) {
                 console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
                 
                 let players = { ...game.players };
@@ -807,13 +808,18 @@ async function processGameRounds() {
                 
                 // Eliminate players based on response time (slowest gets eliminated)
                 if (alivePlayersWhoActed.length > 1) {
-                    // Sort by response time (slowest first)
-                    alivePlayersWhoActed.sort((a, b) => (b.responseTime || 0) - (a.responseTime || 0));
+                    // Sort by response time (slowest first) - FIXED: Ensure proper sorting
+                    alivePlayersWhoActed.sort((a, b) => {
+                        const aTime = a.responseTime || 0;
+                        const bTime = b.responseTime || 0;
+                        return bTime - aTime; // Descending order (slowest first)
+                    });
                     
                     // Eliminate the slowest player
                     const slowestPlayer = alivePlayersWhoActed[0];
                     players[slowestPlayer.address] = { ...slowestPlayer, status: 'eliminated' };
                     console.log(`🐌 Eliminated slowest player ${slowestPlayer.address} - Response time: ${slowestPlayer.responseTime}ms`);
+                    console.log(`🏃 Survivors: ${alivePlayersWhoActed.slice(1).map(p => `${p.address.slice(0,4)} (${p.responseTime}ms)`).join(', ')}`);
                 } else if (alivePlayersWhoDidntAct.length > 0) {
                     // Eliminate all players who didn't act
                     alivePlayersWhoDidntAct.forEach(player => {
@@ -844,8 +850,8 @@ async function processGameRounds() {
                                 // Automatically detect token decimals from the blockchain
                                 const tokenDecimals = await getTokenDecimals(connection, config.ballTokenMint);
                                 
-                                // Transfer tokens to winner
-                                const transferResult = await transferTokensToWinner(config, winner.address, parseInt(swapResult.outputAmount));
+                                // Transfer tokens to winner with retry logic
+                                const transferResult = await transferTokensToWinnerWithRetry(config, winner.address, parseInt(swapResult.outputAmount));
                                 
                                 // Jupiter returns the actual token amount (in smallest units)
                                 const actualTokenAmount = parseInt(swapResult.outputAmount);
@@ -941,6 +947,8 @@ exports.fastGameTick = functions.region('us-central1').https.onCall(async (data,
         throw new functions.https.HttpsError('internal', 'Fast tick failed: ' + error.message);
     }
 });
+
+
 
 // Jupiter Swap Function
 async function performJupiterSwap(config, solAmount, winnerAddress) {
@@ -1110,6 +1118,35 @@ function formatTokenAmount(rawAmount, decimals = 9) {
     return formatted;
 }
 
+// Transfer tokens to winner with retry logic
+async function transferTokensToWinnerWithRetry(config, winnerAddress, tokenAmount, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        console.log(`🔄 Transfer attempt ${attempt}/${maxRetries} for ${winnerAddress}`);
+        
+        const result = await transferTokensToWinner(config, winnerAddress, tokenAmount);
+        
+        if (result.success) {
+            console.log(`✅ Transfer successful on attempt ${attempt}`);
+            return result;
+        }
+        
+        console.log(`❌ Transfer attempt ${attempt} failed: ${result.error}`);
+        
+        if (attempt < maxRetries) {
+            const delay = attempt * 2000; // 2s, 4s, 6s delays
+            console.log(`⏳ Waiting ${delay}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+    
+    console.log(`💀 All ${maxRetries} transfer attempts failed`);
+    return {
+        success: false,
+        error: `Failed after ${maxRetries} attempts`,
+        finalAttemptError: 'Max retries exceeded'
+    };
+}
+
 // Transfer tokens to winner
 async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     try {
@@ -1137,6 +1174,20 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
             false,
             tokenProgramId
         );
+        
+        // Check treasury token balance first
+        try {
+            const treasuryBalance = await connection.getTokenAccountBalance(treasuryTokenAccount);
+            const availableTokens = parseInt(treasuryBalance.value.amount);
+            console.log(`💰 Treasury balance: ${availableTokens} raw tokens (${formatTokenAmount(availableTokens, tokenDecimals)} ${config.tokenSymbol})`);
+            
+            if (availableTokens < tokenAmount) {
+                throw new Error(`Insufficient treasury balance: need ${tokenAmount}, have ${availableTokens}`);
+            }
+        } catch (balanceError) {
+            console.error('❌ Error checking treasury balance:', balanceError);
+            // Continue anyway - let the transfer fail with proper error
+        }
         
         const instructions = [];
         
@@ -1184,23 +1235,71 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
             );
         }
         
-        // Send transaction
+        // Send transaction with better error handling
         const transaction = new Transaction().add(...instructions);
-        const signature = await connection.sendTransaction(transaction, [config.treasuryWallet]);
-        await connection.confirmTransaction(signature);
+        
+        // Get latest blockhash for better reliability
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = config.treasuryWallet.publicKey;
+        
+        // Simulate transaction first to catch errors early
+        try {
+            const simulation = await connection.simulateTransaction(transaction);
+            if (simulation.value.err) {
+                throw new Error(`Transaction simulation failed: ${JSON.stringify(simulation.value.err)}`);
+            }
+            console.log(`✅ Transaction simulation successful`);
+        } catch (simError) {
+            console.error('❌ Transaction simulation failed:', simError);
+            throw simError;
+        }
+        
+        // Send and confirm transaction
+        const signature = await connection.sendTransaction(transaction, [config.treasuryWallet], {
+            skipPreflight: false,
+            preflightCommitment: 'confirmed',
+            maxRetries: 3
+        });
+        
+        console.log(`📤 Transaction sent: ${signature}`);
+        
+        // Confirm with timeout
+        const confirmation = await connection.confirmTransaction({
+            signature,
+            blockhash,
+            lastValidBlockHeight
+        }, 'confirmed');
+        
+        if (confirmation.value.err) {
+            throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        }
         
         console.log(`🎉 Token distribution completed! Transaction: ${signature}`);
+        console.log(`🔗 View on Solscan: https://solscan.io/tx/${signature}`);
+        
         return {
             success: true,
             signature,
-            amount: tokenAmount
+            amount: tokenAmount,
+            formattedAmount: formattedAmount
         };
         
     } catch (error) {
         console.error('❌ Token distribution failed:', error);
+        
+        // Extract more detailed error information
+        let errorMessage = error?.message || 'Unknown error during token distribution';
+        
+        if (error?.logs) {
+            console.error('📋 Transaction logs:', error.logs);
+            errorMessage += ` | Logs: ${error.logs.join('; ')}`;
+        }
+        
         return {
             success: false,
-            error: error?.message || 'Unknown error during token distribution'
+            error: errorMessage,
+            logs: error?.logs || null
         };
     }
 }
