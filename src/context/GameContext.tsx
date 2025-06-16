@@ -19,6 +19,8 @@ export interface GameData {
   maxPlayers: number;
   countdownDuration: number;
   countdownStartedAt: any;
+  roundStartedAt: any;          // Timestamp when current round started
+  roundDurationSec?: number;    // Optional round duration from config
   prize?: any;
   winner?: string;
 }
