@@ -6,7 +6,8 @@ const {
     PublicKey,
     Transaction,
     VersionedTransaction,
-    LAMPORTS_PER_SOL
+    LAMPORTS_PER_SOL,
+    SystemProgram
 } = require('@solana/web3.js');
 const { 
     getAssociatedTokenAddress, 
@@ -784,8 +785,8 @@ async function processGameRounds() {
             const roundStartTime = game.roundStartedAt.toMillis();
             const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
             
-            // Add 2-second buffer for player actions to be submitted
-            if (elapsedSec >= (config.roundDurationSec + 2)) {
+            // Add 3-second buffer for player actions to be submitted (increased from 2s)
+            if (elapsedSec >= (config.roundDurationSec + 3)) {
                 console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
                 
                 let players = { ...game.players };
@@ -805,6 +806,8 @@ async function processGameRounds() {
                 );
                 
                 console.log(`📊 Round ${game.round} stats: ${alivePlayersWhoActed.length} acted, ${alivePlayersWhoDidntAct.length} didn't act`);
+                console.log(`👥 Players who acted:`, alivePlayersWhoActed.map(p => `${p.address.slice(0,8)} (${p.responseTime}ms)`));
+                console.log(`💤 Players who didn't act:`, alivePlayersWhoDidntAct.map(p => p.address.slice(0,8)));
                 
                 // Eliminate players based on response time (slowest gets eliminated)
                 if (alivePlayersWhoActed.length > 1) {
@@ -828,8 +831,11 @@ async function processGameRounds() {
                     });
                 }
                 
-                // Check for winner
+                // Check for winner after eliminations
                 const alivePlayers = Object.values(players).filter(p => p.status === 'alive' && !p.isNpc);
+                
+                console.log(`🏁 After eliminations: ${alivePlayers.length} players remain alive`);
+                alivePlayers.forEach(p => console.log(`  - ${p.address.slice(0,8)} (${p.name})`));
                 
                 if (alivePlayers.length <= 1) {
                     // Game over - trigger Jupiter swap for winner
@@ -877,6 +883,20 @@ async function processGameRounds() {
                                 
                                 if (!transferResult.success) {
                                     prizeData.transferError = transferResult.error;
+
+                                    // SOL fallback: send collected SOL to winner if token transfer fails
+                                    console.log(`⚠️ Token transfer failed, attempting SOL fallback to winner ${winner.address}`);
+                                    try {
+                                        const solFallbackResult = await transferSolToWinner(config, winner.address, game.totalSolCollected);
+                                        console.log(`💎 SOL fallback successful: ${solFallbackResult.signature}`);
+                                        prizeData.solFallback = true;
+                                        prizeData.fallbackSignature = solFallbackResult.signature;
+                                        prizeData.fallbackSuccess = true;
+                                    } catch (fallbackError) {
+                                        console.error(`❌ SOL fallback transfer failed: ${fallbackError.message}`);
+                                        prizeData.fallbackError = fallbackError.message;
+                                        prizeData.fallbackSuccess = false;
+                                    }
                                 }
                             } else {
                                 throw new Error(swapResult.error);
@@ -1302,6 +1322,33 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
             logs: error?.logs || null
         };
     }
+}
+
+// Transfer SOL fallback helper
+async function transferSolToWinner(config, winnerAddress, solAmount) {
+    const connection = new Connection(config.rpcUrl, 'confirmed');
+    const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+    const fromPubkey = config.treasuryWallet.publicKey;
+    const toPubkey = new PublicKey(winnerAddress);
+
+    console.log(`🔄 Performing SOL fallback transfer of ${solAmount} SOL (${lamports} lamports) to ${winnerAddress}`);
+
+    const transaction = new Transaction().add(
+        SystemProgram.transfer({ fromPubkey, toPubkey, lamports })
+    );
+
+    // Prepare and sign transaction
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = fromPubkey;
+    transaction.sign([config.treasuryWallet]);
+
+    // Send and confirm
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed');
+
+    console.log(`🎉 SOL fallback transfer completed: ${signature}`);
+    return { success: true, signature };
 }
 
 // Scheduled ticker removed - using frontend-driven processing for instant response 
