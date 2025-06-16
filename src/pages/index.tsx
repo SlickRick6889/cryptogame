@@ -1,9 +1,14 @@
 'use client';
-import React from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
+import React, { useState } from 'react';
+import { useWallet, useConnection } from '@solana/wallet-adapter-react';
+import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { useGame } from '../context/GameContext';
 
 export default function Home() {
-  const { publicKey, connect, disconnect, connected } = useWallet();
+  const { publicKey, sendTransaction, connect, disconnect, connected } = useWallet();
+  const { connection } = useConnection();
+  const { joinLobby, gameData, gameId } = useGame();
+  const [loading, setLoading] = useState(false);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-4">
@@ -20,8 +25,32 @@ export default function Home() {
           <p className="text-lg">Connected: {publicKey?.toBase58().slice(0, 8)}…</p>
           <button
             className="bg-green-600 hover:bg-green-500 px-6 py-3 rounded-lg font-medium"
-            onClick={() => {
-              /* TODO: Implement join multiplayer game */
+            disabled={loading}
+            onClick={async () => {
+              if (!publicKey || !connection) return;
+              setLoading(true);
+              try {
+                const address = publicKey.toBase58();
+                const result = await joinLobby(address);
+                if (!result.success && result.requiresPayment) {
+                  // Process SOL payment
+                  const lamports = Math.floor(result.entryFee * LAMPORTS_PER_SOL);
+                  const txn = new Transaction().add(
+                    SystemProgram.transfer({
+                      fromPubkey: publicKey,
+                      toPubkey: new PublicKey(result.treasuryAddress),
+                      lamports,
+                    })
+                  );
+                  const sig = await sendTransaction(txn, connection);
+                  await connection.confirmTransaction(sig, 'confirmed');
+                  // Retry join
+                  await joinLobby(address, sig);
+                }
+              } catch (err) {
+                console.error('Join error:', err);
+              }
+              setLoading(false);
             }}
           >
             🎯 Join Multiplayer Game
@@ -32,6 +61,7 @@ export default function Home() {
           >
             🔌 Disconnect
           </button>
+          {gameId && <p className="text-sm">Game ID: {gameId}</p>}
         </div>
       )}
     </div>
