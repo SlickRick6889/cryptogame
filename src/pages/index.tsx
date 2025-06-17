@@ -167,7 +167,9 @@ export default function Home() {
                   Supports all major wallets with mobile deep linking!
                 </p>
               </div>
-              <WalletMultiButton className="wallet-btn" />
+              <div>
+                <WalletMultiButton className="wallet-btn" />
+              </div>
               <div id="wallet-status" className="text-sm mt-2">
                 {connected ? `Connected: ${publicKey?.toBase58().slice(0, 8)}...` : 'Not Connected'}
               </div>
@@ -283,6 +285,21 @@ export default function Home() {
                     Play Again
                   </button>
                 </div>
+              )}
+
+              {gameData.status === 'ended' && (
+                <div className="game-card">
+                  <p className="status">Game Ended</p>
+                  <p className="text-white">This game has concluded or was cancelled.</p>
+                  <button onClick={() => { /* Handle play again */ }} className="action-btn mt-6">
+                    Play Another Game
+                  </button>
+                </div>
+              )}
+
+              {/* Fallback for unhandled statuses or initial loading after gameData is fetched */}
+              {!['waiting', 'lobby', 'starting', 'in_progress', 'completed', 'ended'].includes(gameData.status) && (
+                <p className="text-center text-white mt-20 status">Loading game state...</p>
               )}
             </>
           )}
