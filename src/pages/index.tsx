@@ -8,7 +8,7 @@ import { useGame } from '../context/GameContext';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 
 export default function Home() {
-  const { publicKey, sendTransaction, connected } = useWallet();
+  const { publicKey, sendTransaction, connected, disconnect } = useWallet();
   const { connection } = useConnection();
   const { joinLobby, requestRefund, playerAction, gameData, gameId } = useGame();
   const [loadingJoin, setLoadingJoin] = useState(false);
@@ -66,8 +66,10 @@ export default function Home() {
 
   // Handlers
   const handleJoin = async () => {
+    console.log("handleJoin called"); // Debug log
     if (!publicKey || !connection || !config) {
       setErrorMessage('Wallet not connected or config not loaded.');
+      console.log("handleJoin - pre-checks failed"); // Debug log
       return;
     }
     setLoadingJoin(true);
@@ -109,6 +111,7 @@ export default function Home() {
       setErrorMessage(`Error joining lobby: ${err.message || err}`);
     }
     setLoadingJoin(false);
+    console.log("handleJoin finished. loadingJoin set to false"); // Debug log
   };
 
   const handleAction = async () => {
@@ -181,7 +184,7 @@ export default function Home() {
               <button className="action-btn" onClick={handleJoin} disabled={loadingJoin}>
                 {loadingJoin ? 'Joining...' : '🎯 JOIN MULTIPLAYER GAME'}
               </button>
-              <button onClick={() => { /* Placeholder for disconnect logic if needed here */ }} className="action-btn" style={{ background: 'linear-gradient(45deg, #ff4444, #ff0000)' }}>
+              <button onClick={disconnect} className="action-btn" style={{ background: 'linear-gradient(45deg, #ff4444, #ff0000)' }}>
                 Disconnect
               </button>
             </div>
