@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { db, callJoinLobby, callPlayerAction, callRequestRefund, callFastGameTick } from '../../lib/firebase';
 import { doc, onSnapshot } from 'firebase/firestore';
+import { Timestamp } from 'firebase/firestore';
 
 // Define types
 export interface Player {
@@ -12,17 +13,19 @@ export interface Player {
 }
 
 export interface GameData {
-  status: 'waiting' | 'lobby' | 'starting' | 'in_progress' | 'completed' | 'cancelled';
-  players: Record<string, Player>;
-  round: number;
+  gameId: string;
+  status: 'waiting' | 'lobby' | 'starting' | 'in_progress' | 'completed' | 'ended';
   playerCount: number;
   maxPlayers: number;
+  players: { [key: string]: { status: 'alive' | 'eliminated' } };
+  round: number;
+  roundDurationSec: number;
+  roundStartedAt: Timestamp;
   countdownDuration: number;
-  countdownStartedAt: any;
-  roundStartedAt: any;          // Timestamp when current round started
-  roundDurationSec?: number;    // Optional round duration from config
-  prize?: any;
+  countdownStartedAt: Timestamp;
+  prize?: { prizeAmountFormatted: string; tokenSymbol: string };
   winner?: string;
+  statusMessage?: string;
 }
 
 interface GameContextValue {
