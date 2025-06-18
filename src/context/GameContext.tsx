@@ -23,7 +23,18 @@ export interface GameData {
   roundStartedAt: Timestamp;
   countdownDuration: number;
   countdownStartedAt: Timestamp;
-  prize?: { prizeAmountFormatted: string; tokenSymbol: string };
+  prize?: { 
+    prizeAmountFormatted: string; 
+    tokenSymbol: string;
+    processing?: boolean;
+    status?: string;
+    swapFailed?: boolean;
+    error?: string;
+    swapSignature?: string;
+    transferSignature?: string;
+    rawAmount?: number;
+    solCollected?: number;
+  };
   winner?: string;
   statusMessage?: string;
 }
@@ -38,6 +49,7 @@ interface GameContextValue {
     clientTimestamp: number;
     clientResponseTime: number;
     roundStartTime: number;
+    buttonAppearanceTime?: number;
   }) => Promise<any>;
   requestRefund: (gameId: string, playerAddress: string) => Promise<any>;
   fastGameTick: () => Promise<any>;
@@ -75,6 +87,7 @@ export const GameProvider: React.FC<React.PropsWithChildren<{}>> = ({ children }
     clientTimestamp: number;
     clientResponseTime: number;
     roundStartTime: number;
+    buttonAppearanceTime?: number;
   }) => {
     const res = await callPlayerAction(params);
     return res.data;

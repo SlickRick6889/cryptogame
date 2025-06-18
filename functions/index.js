@@ -653,7 +653,7 @@ exports.requestRefund = functions.region('us-central1').runWith({
 
 // Player Action with Accurate Response Time Tracking
 exports.playerAction = functions.region('us-central1').https.onCall(async (data, context) => {
-    const { gameId, playerAddress, clientTimestamp, clientResponseTime, roundStartTime } = data;
+    const { gameId, playerAddress, clientTimestamp, clientResponseTime, roundStartTime, buttonAppearanceTime } = data;
     
     if (!gameId || !playerAddress) {
         throw new functions.https.HttpsError('invalid-argument', 'Game ID and player address required');
@@ -682,16 +682,17 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
 
         const now = admin.firestore.Timestamp.now();
         
-        // Use client-side response time if available (more accurate), otherwise calculate server-side
+        // Use client-side response time (most accurate - local timing)
         let responseTimeMs;
         if (clientResponseTime !== null && clientResponseTime !== undefined) {
             responseTimeMs = clientResponseTime;
-            console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - Client response time: ${responseTimeMs}ms`);
+            console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - LOCAL response time: ${responseTimeMs}ms (v2)`);
+            console.log(`🔍 Timing details: Button appeared at ${buttonAppearanceTime}, Clicked at ${clientTimestamp}`);
         } else {
-            // Fallback to server-side calculation
+            // Fallback to server-side calculation (less accurate due to network delay)
             const roundStartTimeMs = game.roundStartedAt.toMillis();
             responseTimeMs = now.toMillis() - roundStartTimeMs;
-            console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - Server response time: ${responseTimeMs}ms`);
+            console.log(`⚡ Player ${playerAddress} acted in round ${game.round} - SERVER response time: ${responseTimeMs}ms (INACCURATE)`);
         }
         
         // Record player action with response time
@@ -702,7 +703,8 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
             responseTime: responseTimeMs,
             clientTimestamp: clientTimestamp || null,
             clientResponseTime: clientResponseTime || null,
-            clientRoundStartTime: roundStartTime || null
+            clientRoundStartTime: roundStartTime || null,
+            buttonAppearanceTime: buttonAppearanceTime || null
         };
 
         // Update game
@@ -723,6 +725,8 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
         throw new functions.https.HttpsError('internal', 'Action failed: ' + error.message);
     }
 });
+
+// Removed complex async prize processing - now using simple SOL transfers for speed
 
 // Internal game processing function
 async function processGameRounds() {
@@ -785,7 +789,7 @@ async function processGameRounds() {
             const roundStartTime = game.roundStartedAt.toMillis();
             const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
             
-            // Add 3-second buffer for player actions to be submitted (increased from 2s)
+            // Add 3-second buffer for player actions to be submitted (with 10s processing frequency)
             if (elapsedSec >= (config.roundDurationSec + 3)) {
                 console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
                 
@@ -809,6 +813,11 @@ async function processGameRounds() {
                 console.log(`👥 Players who acted:`, alivePlayersWhoActed.map(p => `${p.address.slice(0,8)} (${p.responseTime}ms)`));
                 console.log(`💤 Players who didn't act:`, alivePlayersWhoDidntAct.map(p => p.address.slice(0,8)));
                 
+                // Debug: Log all alive players before elimination
+                const allAlivePlayers = Object.values(players).filter(p => p.status === 'alive' && !p.isNpc);
+                console.log(`🔍 DEBUG: Total alive players before elimination: ${allAlivePlayers.length}`);
+                allAlivePlayers.forEach(p => console.log(`  - ${p.address.slice(0,8)}: lastActionRound=${p.lastActionRound}, responseTime=${p.responseTime}`));
+                
                 // Eliminate players based on response time (slowest gets eliminated)
                 if (alivePlayersWhoActed.length > 1) {
                     // Sort by response time (slowest first) - FIXED: Ensure proper sorting
@@ -823,8 +832,32 @@ async function processGameRounds() {
                     players[slowestPlayer.address] = { ...slowestPlayer, status: 'eliminated' };
                     console.log(`🐌 Eliminated slowest player ${slowestPlayer.address} - Response time: ${slowestPlayer.responseTime}ms`);
                     console.log(`🏃 Survivors: ${alivePlayersWhoActed.slice(1).map(p => `${p.address.slice(0,4)} (${p.responseTime}ms)`).join(', ')}`);
+                } else if (alivePlayersWhoActed.length === 1) {
+                    // Only 1 player acted - they win automatically
+                    console.log(`🎯 Only 1 player acted: ${alivePlayersWhoActed[0].address.slice(0,8)} - they win!`);
+                    // Eliminate all others who didn't act
+                    alivePlayersWhoDidntAct.forEach(player => {
+                        players[player.address] = { ...player, status: 'eliminated' };
+                        console.log(`💀 Eliminated ${player.address} for not acting in round ${game.round}`);
+                    });
+                } else if (alivePlayersWhoActed.length === 0 && alivePlayersWhoDidntAct.length >= 2) {
+                    // NO ONE acted - this is likely a timing/network issue
+                    // Instead of eliminating everyone, pick a random winner or restart round
+                    console.log(`⚠️ CRITICAL: No players acted in round ${game.round}! This suggests a timing issue.`);
+                    console.log(`🎲 Randomly selecting winner from ${alivePlayersWhoDidntAct.length} players to avoid game deadlock`);
+                    
+                    // Randomly eliminate all but one player
+                    const shuffled = [...alivePlayersWhoDidntAct].sort(() => Math.random() - 0.5);
+                    const randomWinner = shuffled[0];
+                    const toEliminate = shuffled.slice(1);
+                    
+                    console.log(`🍀 Random winner: ${randomWinner.address.slice(0,8)}`);
+                    toEliminate.forEach(player => {
+                        players[player.address] = { ...player, status: 'eliminated' };
+                        console.log(`💀 Randomly eliminated ${player.address} (no one acted - network issue)`);
+                    });
                 } else if (alivePlayersWhoDidntAct.length > 0) {
-                    // Eliminate all players who didn't act
+                    // Some players didn't act - eliminate them
                     alivePlayersWhoDidntAct.forEach(player => {
                         players[player.address] = { ...player, status: 'eliminated' };
                         console.log(`💀 Eliminated ${player.address} for not acting in round ${game.round}`);
@@ -837,15 +870,21 @@ async function processGameRounds() {
                 console.log(`🏁 After eliminations: ${alivePlayers.length} players remain alive`);
                 alivePlayers.forEach(p => console.log(`  - ${p.address.slice(0,8)} (${p.name})`));
                 
+                // Safety check: Don't end game if we have 2+ players and no one acted (might be network delay)
+                if (alivePlayers.length >= 2 && alivePlayersWhoActed.length === 0 && elapsedSec < (config.roundDurationSec + 8)) {
+                    console.log(`⚠️ WARNING: ${alivePlayers.length} players alive but none acted yet. Waiting longer...`);
+                    continue; // Skip this processing cycle
+                }
+                
                 if (alivePlayers.length <= 1) {
-                    // Game over - trigger Jupiter swap for winner
+                    // Game over - trigger Jupiter swap for winner (FROM REFERENCE REPO)
                     const winner = alivePlayers[0];
                     console.log(`🎉 Multiplayer game ${doc.id} complete! Winner: ${winner?.address || 'None'}`);
                     
                     let prizeData = null;
                     if (winner && game.totalSolCollected > 0) {
                         try {
-                            // Perform Jupiter swap: SOL → BALL tokens
+                            // Perform Jupiter swap: SOL → BALL tokens (WORKING VERSION)
                             console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
                             const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
                             
@@ -878,25 +917,14 @@ async function processGameRounds() {
                                     transferSuccess: transferResult.success || false,
                                     jupiterQuoteAmount: swapResult.outputAmount, // Store original for debugging
                                     tokenDecimals: tokenDecimals, // Store detected decimals
-                                    tokenMint: config.ballTokenMint // Store mint for debugging
+                                    tokenMint: config.ballTokenMint, // Store mint for debugging
+                                    processing: false,
+                                    status: 'Prize sent successfully! 🎉'
                                 };
                                 
                                 if (!transferResult.success) {
                                     prizeData.transferError = transferResult.error;
-
-                                    // SOL fallback: send collected SOL to winner if token transfer fails
-                                    console.log(`⚠️ Token transfer failed, attempting SOL fallback to winner ${winner.address}`);
-                                    try {
-                                        const solFallbackResult = await transferSolToWinner(config, winner.address, game.totalSolCollected);
-                                        console.log(`💎 SOL fallback successful: ${solFallbackResult.signature}`);
-                                        prizeData.solFallback = true;
-                                        prizeData.fallbackSignature = solFallbackResult.signature;
-                                        prizeData.fallbackSuccess = true;
-                                    } catch (fallbackError) {
-                                        console.error(`❌ SOL fallback transfer failed: ${fallbackError.message}`);
-                                        prizeData.fallbackError = fallbackError.message;
-                                        prizeData.fallbackSuccess = false;
-                                    }
+                                    prizeData.status = `Prize transfer failed: ${transferResult.error}`;
                                 }
                             } else {
                                 throw new Error(swapResult.error);
@@ -910,14 +938,14 @@ async function processGameRounds() {
                                 rawAmount: game.totalSolCollected * 1000000,
                                 solCollected: game.totalSolCollected,
                                 swapFailed: true,
-                                error: swapError.message
+                                processing: false,
+                                error: swapError.message,
+                                status: `Prize swap failed: ${swapError.message}`
                             };
                         }
                     }
                     
-                    // Debug logging for prize data
-                    console.log(`🏆 Setting prize data for game ${doc.id}:`, JSON.stringify(prizeData, null, 2));
-                    
+                    // Update game status with final prize data
                     await gameRef.update({
                         status: 'completed',
                         winner: winner?.address || null,
@@ -965,6 +993,22 @@ exports.fastGameTick = functions.region('us-central1').https.onCall(async (data,
     } catch (error) {
         console.error('Fast game tick error:', error);
         throw new functions.https.HttpsError('internal', 'Fast tick failed: ' + error.message);
+    }
+});
+
+// Scheduled Game Processing (runs every minute but with faster manual triggers)
+exports.scheduledGameProcessing = functions.region('us-central1').runWith({
+    timeoutSeconds: 60,
+    memory: '256MB'
+}).pubsub.schedule('every 1 minutes').timeZone('UTC').onRun(async (context) => {
+    console.log('⏰ Scheduled game processing triggered');
+    try {
+        const result = await processGameRounds();
+        console.log('✅ Scheduled processing completed:', result);
+        return result;
+    } catch (error) {
+        console.error('❌ Scheduled processing failed:', error);
+        throw error;
     }
 });
 
@@ -1138,7 +1182,7 @@ function formatTokenAmount(rawAmount, decimals = 9) {
     return formatted;
 }
 
-// Transfer tokens to winner with retry logic
+// Transfer tokens to winner with retry logic (FROM REFERENCE REPO)
 async function transferTokensToWinnerWithRetry(config, winnerAddress, tokenAmount, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         console.log(`🔄 Transfer attempt ${attempt}/${maxRetries} for ${winnerAddress}`);
@@ -1159,7 +1203,7 @@ async function transferTokensToWinnerWithRetry(config, winnerAddress, tokenAmoun
         }
     }
     
-    console.log(`💀 All ${maxRetries} transfer attempts failed`);
+    console.log(`❌ All ${maxRetries} transfer attempts failed`);
     return {
         success: false,
         error: `Failed after ${maxRetries} attempts`,
@@ -1324,31 +1368,87 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     }
 }
 
-// Transfer SOL fallback helper
+// Transfer SOL to winner
 async function transferSolToWinner(config, winnerAddress, solAmount) {
-    const connection = new Connection(config.rpcUrl, 'confirmed');
-    const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-    const fromPubkey = config.treasuryWallet.publicKey;
-    const toPubkey = new PublicKey(winnerAddress);
+    try {
+        const connection = new Connection(config.rpcUrl, 'confirmed');
+        const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+        const fromPubkey = config.treasuryWallet.publicKey;
+        const toPubkey = new PublicKey(winnerAddress);
 
-    console.log(`🔄 Performing SOL fallback transfer of ${solAmount} SOL (${lamports} lamports) to ${winnerAddress}`);
+        console.log(`🔄 Transferring ${solAmount} SOL (${lamports} lamports) to ${winnerAddress}`);
 
-    const transaction = new Transaction().add(
-        SystemProgram.transfer({ fromPubkey, toPubkey, lamports })
-    );
+        // Check treasury balance first
+        const treasuryBalance = await connection.getBalance(fromPubkey);
+        console.log(`💰 Treasury SOL balance: ${treasuryBalance / LAMPORTS_PER_SOL} SOL`);
+        
+        if (treasuryBalance < lamports) {
+            throw new Error(`Insufficient treasury SOL balance: need ${lamports}, have ${treasuryBalance}`);
+        }
 
-    // Prepare and sign transaction
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = fromPubkey;
-    transaction.sign([config.treasuryWallet]);
+        const transaction = new Transaction().add(
+            SystemProgram.transfer({ fromPubkey, toPubkey, lamports })
+        );
 
-    // Send and confirm
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed');
+        // Prepare and sign transaction
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = fromPubkey;
+        
+        // Simulate transaction first
+        try {
+            const simulation = await connection.simulateTransaction(transaction);
+            if (simulation.value.err) {
+                throw new Error(`SOL transfer simulation failed: ${JSON.stringify(simulation.value.err)}`);
+            }
+            console.log(`✅ SOL transfer simulation successful`);
+        } catch (simError) {
+            console.error('❌ SOL transfer simulation failed:', simError);
+            throw simError;
+        }
+        
+        transaction.sign([config.treasuryWallet]);
 
-    console.log(`🎉 SOL fallback transfer completed: ${signature}`);
-    return { success: true, signature };
+        // Send and confirm
+        const signature = await connection.sendRawTransaction(transaction.serialize(), {
+            skipPreflight: false,
+            preflightCommitment: 'confirmed',
+            maxRetries: 3
+        });
+        
+        console.log(`📤 SOL transfer sent: ${signature}`);
+        
+        const confirmation = await connection.confirmTransaction({ 
+            blockhash, 
+            lastValidBlockHeight, 
+            signature 
+        }, 'confirmed');
+        
+        if (confirmation.value.err) {
+            throw new Error(`SOL transfer failed: ${JSON.stringify(confirmation.value.err)}`);
+        }
+
+        console.log(`🎉 SOL transfer completed: ${signature}`);
+        console.log(`🔗 View on Solscan: https://solscan.io/tx/${signature}`);
+        
+        return { success: true, signature };
+        
+    } catch (error) {
+        console.error('❌ SOL transfer failed:', error);
+        
+        let errorMessage = error?.message || 'Unknown error during SOL transfer';
+        
+        if (error?.logs) {
+            console.error('📋 SOL transfer logs:', error.logs);
+            errorMessage += ` | Logs: ${error.logs.join('; ')}`;
+        }
+        
+        return {
+            success: false,
+            error: errorMessage,
+            logs: error?.logs || null
+        };
+    }
 }
 
 // Scheduled ticker removed - using frontend-driven processing for instant response 

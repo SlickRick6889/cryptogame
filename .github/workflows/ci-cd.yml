@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [multiplayer-v2, main]
   push:
-    branches: [main]
+    branches: [main, multiplayer-v2]
 
 jobs:
   ci:
@@ -27,7 +27,7 @@ jobs:
     name: Deploy to Firebase
     needs: ci
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/multiplayer-v2')
     steps:
       - uses: actions/checkout@v3
       - name: Setup Node.js
