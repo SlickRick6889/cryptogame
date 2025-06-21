@@ -193,52 +193,24 @@ exports.joinLobby = functions.region('us-central1').runWith({
                     `Insufficient SOL balance. Need ${config.entryFeeSol} SOL, have ${solBalance.toFixed(4)} SOL`);
             }
             
-            // IMPROVED: Check for existing lobbies with smart prioritization
+            // Check for existing lobbies that this player can join
             console.log(`🔍 Checking for existing lobbies before payment`);
-            const allAvailableLobbies = await db.collection('games')
+            const existingLobbyQuery = db.collection('games')
                 .where('status', 'in', ['waiting', 'lobby'])
                 .orderBy('createdAt', 'asc')
-                .get();
+                .limit(1);
             
-            console.log(`🔍 Found ${allAvailableLobbies.size} existing lobbies before payment`);
+            const existingLobbies = await existingLobbyQuery.get();
+            console.log(`🔍 Found ${existingLobbies.size} existing lobbies before payment`);
             
             let targetGameId = null;
-            let shouldCreateNew = true;
             
-            // Smart lobby selection - prioritize games that need players
-            for (const doc of allAvailableLobbies.docs) {
-                const gameData = doc.data();
-                const currentPlayerCount = gameData.playerCount || 0;
-                const maxPlayers = gameData.maxPlayers || config.maxPlayers;
-                
-                console.log(`🔍 Evaluating lobby ${doc.id}: status=${gameData.status}, players=${currentPlayerCount}/${maxPlayers}`);
-                
-                // Skip if game is full
-                if (currentPlayerCount >= maxPlayers) {
-                    console.log(`⚠️ Skipping full lobby ${doc.id}`);
-                    continue;
-                }
-                
-                // PRIORITY 1: Games with players waiting (any status)
-                if (currentPlayerCount > 0) {
-                    console.log(`🎯 PRIORITY 1: Found game with waiting players: ${doc.id} (${currentPlayerCount} players)`);
-                    targetGameId = doc.id;
-                    shouldCreateNew = false;
-                    break; // Take the first game with players
-                }
-                
-                // PRIORITY 2: Empty waiting games (if no games with players found)
-                if (!targetGameId && gameData.status === 'waiting' && currentPlayerCount === 0) {
-                    console.log(`🎯 PRIORITY 2: Found empty waiting game: ${doc.id}`);
-                    targetGameId = doc.id;
-                    shouldCreateNew = false;
-                    // Don't break - keep looking for games with players
-                }
-            }
-            
-            // Only create new lobby if no suitable existing lobby found
-            if (shouldCreateNew) {
-                console.log(`🆕 No suitable existing lobby found - creating new game`);
+            if (!existingLobbies.empty) {
+                // Found existing lobby - return its ID for payment
+                targetGameId = existingLobbies.docs[0].id;
+                console.log(`🎯 Will join existing game: ${targetGameId}`);
+            } else {
+                // No existing lobby - create one now (without adding player yet)
                 targetGameId = await getNextGameId();
                 const gameRef = db.collection('games').doc(targetGameId);
                 
@@ -260,9 +232,7 @@ exports.joinLobby = functions.region('us-central1').runWith({
                     countdownDuration: 15
                 });
                 
-                console.log(`🆕 Created new empty lobby: ${targetGameId} (waiting for payment)`);
-            } else {
-                console.log(`🎯 Will join existing game: ${targetGameId}`);
+                console.log(`🆕 Created empty lobby: ${targetGameId} (waiting for payment)`);
             }
             
             // Return payment instruction with target game ID
@@ -273,15 +243,14 @@ exports.joinLobby = functions.region('us-central1').runWith({
                 treasuryAddress: config.treasuryWallet.publicKey.toString(),
                 message: `Please send ${config.entryFeeSol} SOL to join game ${targetGameId}`,
                 targetGameId: targetGameId,
-                existingLobbies: allAvailableLobbies.size,
-                lobbySelectionType: shouldCreateNew ? 'new_game' : 'existing_game'
+                existingLobbies: existingLobbies.size
             };
         }
 
         // Payment will be recorded in game-specific payment summary only
         console.log(`💰 Payment verified: ${config.entryFeeSol} SOL from ${playerAddress}`);
 
-        // Find the best lobby to join with payment
+        // Find the specific lobby to join (should exist from first call)
         console.log(`🔍 Looking for existing lobbies to join with payment`);
         
         // First check if this player is already in an active game
@@ -302,68 +271,26 @@ exports.joinLobby = functions.region('us-central1').runWith({
             throw new functions.https.HttpsError('already-exists', `You are already in game(s): ${playerActiveGames.join(', ')}. Please finish or leave those games first.`);
         }
         
-        // SIMPLE & RELIABLE: Find the first available game with space
-        // Priority: Games with waiting players > Empty games > Create new
-        const waitingGamesQuery = await db.collection('games')
+        // Find the oldest available lobby (first created)
+        const existingLobbyQuery = db.collection('games')
             .where('status', 'in', ['waiting', 'lobby'])
             .orderBy('createdAt', 'asc')
-            .limit(10)
-            .get();
+            .limit(1);
         
-        console.log(`🔍 Found ${waitingGamesQuery.size} available lobbies for payment`);
-        
-        let targetLobby = null;
-        let targetGameData = null;
-        
-        // STEP 1: Look for games with players waiting (highest priority)
-        for (const doc of waitingGamesQuery.docs) {
-            const gameData = doc.data();
-            const currentPlayerCount = gameData.playerCount || 0;
-            const maxPlayers = gameData.maxPlayers || config.maxPlayers;
-            
-            console.log(`🔍 Checking lobby ${doc.id}: status=${gameData.status}, players=${currentPlayerCount}/${maxPlayers}`);
-            
-            // Skip if game is full
-            if (currentPlayerCount >= maxPlayers) {
-                console.log(`⚠️ Skipping full lobby ${doc.id}`);
-                continue;
-            }
-            
-            // FOUND: Game with players waiting - take it immediately!
-            if (currentPlayerCount > 0) {
-                console.log(`🎯 FOUND WAITING GAME: ${doc.id} has ${currentPlayerCount} players waiting!`);
-                targetLobby = doc;
-                targetGameData = gameData;
-                break; // Take the first game with players
-            }
-        }
-        
-        // STEP 2: If no games with players, look for empty games
-        if (!targetLobby) {
-            for (const doc of waitingGamesQuery.docs) {
-                const gameData = doc.data();
-                const currentPlayerCount = gameData.playerCount || 0;
-                
-                if (currentPlayerCount === 0) {
-                    console.log(`🎯 FOUND EMPTY GAME: ${doc.id} - will use this`);
-                    targetLobby = doc;
-                    targetGameData = gameData;
-                    break;
-                }
-            }
-        }
+        const existingLobbies = await existingLobbyQuery.get();
+        console.log(`🔍 Found ${existingLobbies.size} existing lobbies for payment`);
         
         let gameRef;
         let gameData;
         let isNewGame = false;
         
-        if (targetLobby) {
-            gameRef = targetLobby.ref;
-            gameData = targetGameData;
-            console.log(`🔗 SELECTED LOBBY: ${gameRef.id} (status: ${gameData.status}, players: ${gameData.playerCount}/${gameData.maxPlayers || config.maxPlayers})`);
+        if (!existingLobbies.empty) {
+            gameRef = existingLobbies.docs[0].ref;
+            gameData = existingLobbies.docs[0].data();
+            console.log(`🔗 Joining existing lobby with payment: ${gameRef.id} (status: ${gameData.status}, players: ${gameData.playerCount})`);
         } else {
-            // No suitable lobby found - create a new one
-            console.log(`🆕 No suitable lobby found - creating new game`);
+            // This shouldn't happen since first call should create a lobby
+            console.log(`⚠️ No lobby found for payment - creating emergency lobby`);
             const gameId = await getNextGameId();
             gameRef = db.collection('games').doc(gameId);
             gameData = {
@@ -384,125 +311,90 @@ exports.joinLobby = functions.region('us-central1').runWith({
                 countdownDuration: 15
             };
             isNewGame = true;
-            console.log(`🆕 Created new lobby: ${gameId}`);
+            console.log(`🆕 Emergency lobby creation: ${gameId}`);
         }
 
-        // ATOMIC TRANSACTION: Prevent race conditions when joining games
-        let finalGameData = null;
-        
-        await db.runTransaction(async (transaction) => {
-            // Re-fetch the latest game state
-            const currentGameDoc = await transaction.get(gameRef);
-            
-            let currentGameData;
-            if (currentGameDoc.exists) {
-                currentGameData = currentGameDoc.data();
-            } else if (isNewGame) {
-                // Create the new game in the transaction
-                currentGameData = gameData;
-                transaction.set(gameRef, currentGameData);
-            } else {
-                throw new Error('Selected game no longer exists');
-            }
-            
-            const currentPlayers = { ...currentGameData.players };
-            const currentPlayerCount = Object.keys(currentPlayers).length;
-            const maxPlayers = currentGameData.maxPlayers || config.maxPlayers;
-            
-            // Check if game is still joinable
-            if (currentPlayerCount >= maxPlayers) {
-                throw new Error(`Game ${gameRef.id} is now full (${currentPlayerCount}/${maxPlayers})`);
-            }
-            
-            // Check if player already in game
-            if (currentPlayers[playerAddress]) {
-                throw new Error('Player already in this game');
-            }
-            
-            // Add the player
-            currentPlayers[playerAddress] = {
-                address: playerAddress,
-                name: `Player ${playerAddress.slice(0, 4)}`,
-                status: 'alive',
-                isNpc: false,
-                lastActionRound: 0,
-                joinedAt: admin.firestore.FieldValue.serverTimestamp(),
-                solPaid: config.entryFeeSol,
-                transactionSignature: transactionSignature,
-                responseTime: null,
-                refundRequested: false
-            };
-            
-            const newPlayerCount = Object.keys(currentPlayers).length;
-            let newStatus = currentGameData.status;
-            let countdownStartedAt = currentGameData.countdownStartedAt;
-            let message = '';
+        let players = gameData?.players || {};
 
-            // Determine new game state
-            if (newPlayerCount === 1) {
-                newStatus = 'waiting';
-                message = 'Waiting for more players to join...';
-            } else if (newPlayerCount >= 2 && newPlayerCount < maxPlayers) {
-                newStatus = 'lobby';
-                countdownStartedAt = admin.firestore.FieldValue.serverTimestamp();
-                message = `Game will start with ${newPlayerCount}/${maxPlayers} players in 15 seconds. Countdown resets when new players join.`;
-            } else if (newPlayerCount >= maxPlayers) {
-                newStatus = 'starting';
-                countdownStartedAt = null;
-                message = 'Game is full! Starting now - no refunds allowed.';
-            }
+        // Check if player already in game
+        if (players[playerAddress]) {
+            throw new functions.https.HttpsError('already-exists', 'Player already in this game');
+        }
 
-            // Update game data
-            const updateData = {
-                players: currentPlayers,
-                playerCount: newPlayerCount,
-                status: newStatus,
-                totalSolCollected: admin.firestore.FieldValue.increment(config.entryFeeSol),
-                payments: admin.firestore.FieldValue.arrayUnion({
-                    player: playerAddress,
-                    signature: transactionSignature,
-                    amount: config.entryFeeSol
-                }),
-                countdownStartedAt: countdownStartedAt,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            };
+        // Add the player
+        players[playerAddress] = {
+            address: playerAddress,
+            name: `Player ${playerAddress.slice(0, 4)}`,
+            status: 'alive',
+            isNpc: false,
+            lastActionRound: 0,
+            joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+            solPaid: config.entryFeeSol,
+            transactionSignature: transactionSignature,
+            responseTime: null, // Will track button press timing
+            refundRequested: false // Track if player requested refund
+        };
+        console.log(`✅ Added player ${playerAddress} to lobby`);
 
-            // Start game immediately if max players reached
-            if (newPlayerCount >= maxPlayers) {
-                Object.assign(updateData, {
-                    status: 'in_progress',
-                    round: 1,
-                    roundStartedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-                
-                console.log(`🔄 Starting game ${gameRef.id} immediately with ${newPlayerCount} players`);
-            }
+        const playerCount = Object.keys(players).length;
+        let newStatus = gameData.status;
+        let countdownStartedAt = gameData.countdownStartedAt;
+        let message = '';
 
-            transaction.update(gameRef, updateData);
+        // Determine new game state
+        if (playerCount === 1) {
+            newStatus = 'waiting';
+            message = 'Waiting for more players to join...';
+        } else if (playerCount >= 2 && playerCount < config.maxPlayers) {
+            newStatus = 'lobby';
+            countdownStartedAt = admin.firestore.FieldValue.serverTimestamp();
+            message = `Game will start with ${playerCount}/${config.maxPlayers} players in 15 seconds. Countdown resets when new players join.`;
+        } else if (playerCount >= config.maxPlayers) {
+            newStatus = 'starting';
+            countdownStartedAt = null;
+            message = 'Game is full! Starting now - no refunds allowed.';
+        }
+
+        // Update game data
+        const updateData = {
+            players: players,
+            playerCount: playerCount,
+            status: newStatus,
+            totalSolCollected: admin.firestore.FieldValue.increment(config.entryFeeSol),
+            payments: admin.firestore.FieldValue.arrayUnion({
+                player: playerAddress,
+                signature: transactionSignature,
+                amount: config.entryFeeSol
+            }),
+            countdownStartedAt: countdownStartedAt,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        // Start game immediately if max players reached
+        if (playerCount >= config.maxPlayers) {
+            Object.assign(updateData, {
+                status: 'in_progress',
+                round: 1,
+                roundStartedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
             
-            // Store final data for return
-            finalGameData = {
-                gameId: gameRef.id,
-                message: message,
-                playerCount: newPlayerCount,
-                maxPlayers: maxPlayers,
-                status: newStatus,
-                isNewGame: isNewGame
-            };
-            
-            console.log(`✅ TRANSACTION SUCCESS: Added player ${playerAddress} to game ${gameRef.id} (${newPlayerCount}/${maxPlayers})`);
-        });
+            // Start background SOL to BALL swap for faster prize distribution
+            console.log(`🔄 Starting background SOL swap for game ${gameRef.id}`);
+            // Note: We'll implement this swap in the background
+        }
+
+        await gameRef.set(updateData, { merge: true });
 
         return { 
             success: true, 
-            gameId: finalGameData.gameId,
-            message: finalGameData.message,
+            gameId: gameRef.id,
+            message: message,
             entryFee: config.entryFeeSol,
             paymentVerified: true,
-            playerCount: finalGameData.playerCount,
-            maxPlayers: finalGameData.maxPlayers,
-            status: finalGameData.status,
-            isNewGame: finalGameData.isNewGame
+            playerCount: playerCount,
+            maxPlayers: config.maxPlayers,
+            status: newStatus,
+            isNewGame: isNewGame
         };
 
     } catch (error) {
@@ -819,7 +711,7 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
         }
         
         // Record player action with response time
-        const updatedPlayer = {
+        players[playerAddress] = {
             ...player,
             lastActionRound: game.round,
             lastActionAt: now,
@@ -829,66 +721,11 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
             clientRoundStartTime: roundStartTime || null
         };
 
-        // CRITICAL FIX: Use transaction with retry to prevent race conditions
-        let transactionSuccess = false;
-        let retryCount = 0;
-        const maxRetries = 3;
-        
-        while (!transactionSuccess && retryCount < maxRetries) {
-            try {
-                await db.runTransaction(async (transaction) => {
-                    const currentGameDoc = await transaction.get(gameRef);
-                    
-                    if (!currentGameDoc.exists) {
-                        throw new Error('Game no longer exists');
-                    }
-                    
-                    const currentGame = currentGameDoc.data();
-                    const currentPlayers = { ...currentGame.players };
-                    
-                    // Double-check player is still alive and game is still in progress
-                    const currentPlayer = currentPlayers[playerAddress];
-                    if (!currentPlayer || currentPlayer.status !== 'alive') {
-                        throw new Error('Player no longer alive');
-                    }
-                    
-                    if (currentGame.status !== 'in_progress') {
-                        throw new Error(`Game no longer in progress: ${currentGame.status}`);
-                    }
-                    
-                    // Check if action already recorded (prevent duplicates)
-                    if (currentPlayer.lastActionRound >= currentGame.round) {
-                        console.log(`⚠️ Action already recorded for player ${playerAddress} in round ${currentGame.round}`);
-                        transactionSuccess = true;
-                        return;
-                    }
-                    
-                    // Update the player data
-                    currentPlayers[playerAddress] = updatedPlayer;
-                    
-                    // Atomic update
-                    transaction.update(gameRef, {
-                        players: currentPlayers,
-                        updatedAt: now
-                    });
-                    
-                    console.log(`🔒 TRANSACTION SUCCESS: Player ${playerAddress} action recorded for round ${currentGame.round} (${responseTimeMs}ms)`);
-                });
-                
-                transactionSuccess = true;
-                
-            } catch (transactionError) {
-                retryCount++;
-                console.error(`❌ Transaction attempt ${retryCount} failed for player ${playerAddress}:`, transactionError.message);
-                
-                if (retryCount >= maxRetries) {
-                    throw new Error(`Transaction failed after ${maxRetries} attempts: ${transactionError.message}`);
-                }
-                
-                // Wait before retry (exponential backoff)
-                await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 100));
-            }
-        }
+        // Update game
+        await gameRef.update({
+            players: players,
+            updatedAt: now
+        });
 
         return { 
             success: true, 
@@ -2081,311 +1918,4 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     }
 }
 
-// Manual Game Recovery Function (Admin use)
-exports.fixStuckGame = functions.region('us-central1').https.onCall(async (data, context) => {
-    const { gameId } = data;
-    
-    if (!gameId) {
-        throw new functions.https.HttpsError('invalid-argument', 'Game ID required');
-    }
-
-    try {
-        console.log(`🔧 Attempting to fix stuck game: ${gameId}`);
-        
-        const config = await getGameConfig();
-        const gameRef = db.collection('games').doc(gameId);
-        const gameDoc = await gameRef.get();
-        
-        if (!gameDoc.exists) {
-            throw new functions.https.HttpsError('not-found', 'Game not found');
-        }
-
-        const game = gameDoc.data();
-        
-        if (game.status !== 'in_progress') {
-            throw new functions.https.HttpsError('failed-precondition', `Game not stuck (status: ${game.status})`);
-        }
-
-        const players = Object.values(game.players).filter(p => !p.isNpc);
-        const alivePlayers = players.filter(p => p.status === 'alive');
-        
-        console.log(`🔍 Game ${gameId} analysis:`);
-        console.log(`   - Status: ${game.status}, Round: ${game.round}`);
-        console.log(`   - Alive players: ${alivePlayers.length}/${players.length}`);
-        console.log(`   - Round started: ${game.roundStartedAt ? new Date(game.roundStartedAt.toMillis()).toISOString() : 'N/A'}`);
-        
-        // Check if round has been running too long (more than 30 seconds)
-        const now = admin.firestore.Timestamp.now();
-        const roundStartTime = game.roundStartedAt ? game.roundStartedAt.toMillis() : 0;
-        const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
-        
-        if (elapsedSec < 30) {
-            throw new functions.https.HttpsError('failed-precondition', `Round only running for ${elapsedSec.toFixed(1)}s - not stuck yet`);
-        }
-        
-        console.log(`⏰ Round running for ${elapsedSec.toFixed(1)} seconds - forcing processing`);
-        
-        // Force process the round
-        const result = await processSpecificGame(gameId);
-        
-        return {
-            success: true,
-            message: `Game ${gameId} processing forced`,
-            elapsedSeconds: elapsedSec.toFixed(1),
-            result: result
-        };
-        
-    } catch (error) {
-        console.error('❌ Fix stuck game error:', error);
-        throw new functions.https.HttpsError('internal', 'Failed to fix game: ' + error.message);
-    }
-});
-
-// Process a specific game by ID
-async function processSpecificGame(gameId) {
-    const config = await getGameConfig();
-    const gameRef = db.collection('games').doc(gameId);
-    const gameDoc = await gameRef.get();
-    
-    if (!gameDoc.exists) {
-        throw new Error('Game not found');
-    }
-    
-    const game = gameDoc.data();
-    const now = admin.firestore.Timestamp.now();
-    
-    console.log(`🎯 Force processing game ${gameId} (status: ${game.status}, round: ${game.round})`);
-    
-    if (game.status !== 'in_progress') {
-        return { message: 'Game not in progress', status: game.status };
-    }
-    
-    // Re-fetch to get latest player data
-    const latestGameDoc = await gameRef.get();
-    const latestGame = latestGameDoc.data();
-    const players = { ...latestGame.players };
-    
-    console.log(`🔄 Processing round ${latestGame.round} for game ${gameId}`);
-    
-    // Get all alive players who acted this round
-    const alivePlayersWhoActed = Object.values(players).filter(p => 
-        p.status === 'alive' && 
-        p.lastActionRound === latestGame.round &&
-        !p.isNpc
-    );
-    
-    // Get all alive players who didn't act
-    const alivePlayersWhoDidntAct = Object.values(players).filter(p => 
-        p.status === 'alive' && 
-        p.lastActionRound < latestGame.round &&
-        !p.isNpc
-    );
-    
-    console.log(`📊 Round ${latestGame.round} stats: ${alivePlayersWhoActed.length} acted, ${alivePlayersWhoDidntAct.length} didn't act`);
-    
-    // Log detailed player status
-    Object.values(players).filter(p => !p.isNpc).forEach(player => {
-        const acted = player.lastActionRound >= latestGame.round ? 'YES' : 'NO';
-        const responseTime = player.responseTime || 'NULL';
-        console.log(`   ${player.address.slice(0, 8)}: Round ${player.lastActionRound}/${latestGame.round}, Response: ${responseTime}ms, Status: ${player.status}, Acted: ${acted}`);
-    });
-    
-    // Process eliminations and determine winner
-    const processedGame = await processRoundEliminations(gameRef, latestGame, players, config);
-    
-    return {
-        processed: true,
-        eliminatedPlayers: processedGame.eliminatedCount || 0,
-        remainingPlayers: processedGame.remainingCount || 0,
-        winner: processedGame.winner || null,
-        gameStatus: processedGame.status
-    };
-}
-
-// Process round eliminations and determine winner
-async function processRoundEliminations(gameRef, game, players, config) {
-    const now = admin.firestore.Timestamp.now();
-    
-    // Get all alive players who acted this round
-    const alivePlayersWhoActed = Object.values(players).filter(p => 
-        p.status === 'alive' && 
-        p.lastActionRound === game.round &&
-        !p.isNpc
-    );
-    
-    // Get all alive players who didn't act
-    const alivePlayersWhoDidntAct = Object.values(players).filter(p => 
-        p.status === 'alive' && 
-        p.lastActionRound < game.round &&
-        !p.isNpc
-    );
-    
-    console.log(`🔄 Processing eliminations for round ${game.round}`);
-    console.log(`   - Players who acted: ${alivePlayersWhoActed.length}`);
-    console.log(`   - Players who didn't act: ${alivePlayersWhoDidntAct.length}`);
-    
-    let updatedPlayers = { ...players };
-    let eliminatedCount = 0;
-    
-    // First, eliminate players who didn't act
-    if (alivePlayersWhoDidntAct.length > 0) {
-        console.log(`💀 Eliminating ${alivePlayersWhoDidntAct.length} players for no action`);
-        
-        alivePlayersWhoDidntAct.forEach(player => {
-            updatedPlayers[player.address] = {
-                ...player,
-                status: 'eliminated',
-                eliminatedAt: now,
-                eliminationReason: 'no_action'
-            };
-            eliminatedCount++;
-            console.log(`   💀 ${player.address.slice(0, 8)} eliminated (no action)`);
-        });
-    }
-    
-    // Then, if multiple players acted, eliminate the slowest
-    if (alivePlayersWhoActed.length > 1) {
-        // Sort by response time (slowest first)
-        const sortedByResponseTime = [...alivePlayersWhoActed].sort((a, b) => 
-            (b.responseTime || 999999) - (a.responseTime || 999999)
-        );
-        
-        const slowestPlayer = sortedByResponseTime[0];
-        
-        updatedPlayers[slowestPlayer.address] = {
-            ...slowestPlayer,
-            status: 'eliminated',
-            eliminatedAt: now,
-            eliminationReason: 'slowest_response'
-        };
-        eliminatedCount++;
-        
-        console.log(`🐌 Eliminated slowest player ${slowestPlayer.address.slice(0, 8)} - Response time: ${slowestPlayer.responseTime}ms`);
-        
-        // Log survivors
-        const survivors = sortedByResponseTime.slice(1);
-        survivors.forEach(survivor => {
-            console.log(`🏃 Survivor: ${survivor.address.slice(0, 8)} (${survivor.responseTime}ms)`);
-        });
-    }
-    
-    // Check for winner
-    const remainingAlivePlayers = Object.values(updatedPlayers).filter(p => p.status === 'alive' && !p.isNpc);
-    
-    if (remainingAlivePlayers.length === 1) {
-        // We have a winner!
-        const winner = remainingAlivePlayers[0];
-        console.log(`🏆 Winner determined: ${winner.address}`);
-        
-        // Process prize distribution
-        let prizeData = null;
-        if (game.totalSolCollected > 0) {
-            try {
-                const swapResult = await performDirectSwapToWinner(config, game.totalSolCollected, winner.address);
-                
-                if (swapResult.success) {
-                    // Get token decimals for formatting
-                    const connection = new Connection(config.rpcUrl, 'confirmed');
-                    const tokenDecimals = await getTokenDecimals(connection, config.ballTokenMint);
-                    const actualTokenAmount = parseInt(swapResult.outputAmount);
-                    const formattedAmount = (actualTokenAmount / Math.pow(10, tokenDecimals)).toFixed(2);
-                    
-                    prizeData = {
-                        prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
-                        tokenSymbol: config.tokenSymbol,
-                        rawAmount: actualTokenAmount,
-                        solCollected: game.totalSolCollected,
-                        swapSignature: swapResult.signature,
-                        transferSignature: swapResult.signature,
-                        swapSuccess: true,
-                        transferSuccess: true,
-                        jupiterQuoteAmount: swapResult.outputAmount,
-                        tokenDecimals: tokenDecimals,
-                        tokenMint: config.ballTokenMint,
-                        directTransfer: true
-                    };
-                    
-                    console.log(`✅ Prize distributed: ${formattedAmount} ${config.tokenSymbol} to ${winner.address}`);
-                } else {
-                    throw new Error(swapResult.error);
-                }
-            } catch (prizeError) {
-                console.error('❌ Prize distribution failed:', prizeError);
-                prizeData = {
-                    prizeAmountFormatted: 'Error',
-                    tokenSymbol: config.tokenSymbol,
-                    solCollected: game.totalSolCollected,
-                    swapSuccess: false,
-                    transferSuccess: false,
-                    error: prizeError.message
-                };
-            }
-        }
-        
-        // Update game as completed
-        await gameRef.update({
-            status: 'completed',
-            winner: winner.address,
-            players: updatedPlayers,
-            completedAt: now,
-            updatedAt: now,
-            prize: prizeData,
-            finalStats: {
-                totalPlayers: Object.keys(players).filter(addr => !players[addr].isNpc).length,
-                totalRounds: game.round,
-                winnerResponseTime: winner.responseTime || null,
-                eliminationOrder: Object.values(updatedPlayers)
-                    .filter(p => p.status === 'eliminated' && !p.isNpc)
-                    .map(p => ({
-                        address: p.address,
-                        eliminationRound: p.lastActionRound || game.round,
-                        responseTime: p.responseTime || null,
-                        eliminationReason: p.eliminationReason || 'unknown'
-                    }))
-            }
-        });
-        
-        return {
-            status: 'completed',
-            winner: winner.address,
-            eliminatedCount,
-            remainingCount: 1,
-            prize: prizeData
-        };
-        
-    } else if (remainingAlivePlayers.length > 1) {
-        // Continue to next round
-        const nextRound = game.round + 1;
-        
-        await gameRef.update({
-            round: nextRound,
-            roundStartedAt: now,
-            players: updatedPlayers,
-            updatedAt: now
-        });
-        
-        console.log(`➡️ Advancing to round ${nextRound} with ${remainingAlivePlayers.length} players`);
-        
-        return {
-            status: 'in_progress',
-            round: nextRound,
-            eliminatedCount,
-            remainingCount: remainingAlivePlayers.length
-        };
-        
-    } else {
-        // No players left - shouldn't happen but handle gracefully
-        await gameRef.update({
-            status: 'cancelled',
-            players: updatedPlayers,
-            completedAt: now,
-            updatedAt: now
-        });
-        
-        return {
-            status: 'cancelled',
-            eliminatedCount,
-            remainingCount: 0
-        };
-    }
-}
+// Scheduled ticker removed - using frontend-driven processing for instant response 
