@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🎮 CRYPTO ELIMINATION 🎮</title>
-    <!-- Cache buster: v1.2 -->
+    <!-- Cache buster: v1.3 -->
     <style>
         * {
             margin: 0;
@@ -186,6 +186,80 @@
         .hidden { display: none; }
         .error { color: #ff0000; margin: 10px 0; }
         .success { color: #00ff00; margin: 10px 0; }
+
+        /* Rankings Styles */
+        .ranking-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 15px;
+            margin: 5px 0;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: bold;
+        }
+
+        .ranking-item.rank-1 {
+            background: linear-gradient(45deg, #ffd700, #ffed4e);
+            color: #000;
+            border: 2px solid #ffd700;
+        }
+
+        .ranking-item.rank-2 {
+            background: linear-gradient(45deg, #c0c0c0, #e8e8e8);
+            color: #000;
+            border: 2px solid #c0c0c0;
+        }
+
+        .ranking-item.rank-3 {
+            background: linear-gradient(45deg, #cd7f32, #e6a85c);
+            color: #fff;
+            border: 2px solid #cd7f32;
+        }
+
+        .ranking-item.alive {
+            background: linear-gradient(45deg, #00ff00, #32ff32);
+            color: #000;
+            border: 2px solid #00ff00;
+        }
+
+        .ranking-item.eliminated {
+            background: linear-gradient(45deg, #ff4444, #ff6666);
+            color: #fff;
+            border: 2px solid #ff4444;
+        }
+
+        .ranking-item.current-player {
+            box-shadow: 0 0 15px rgba(255, 255, 255, 0.6);
+            transform: scale(1.02);
+        }
+
+        .player-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .player-rank {
+            font-size: 1.1rem;
+            font-weight: bold;
+            min-width: 30px;
+        }
+
+        .player-address {
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+
+        .response-time {
+            font-size: 0.9rem;
+            font-weight: bold;
+        }
+
+        .elimination-round {
+            font-size: 0.8rem;
+            opacity: 0.8;
+        }
     </style>
 </head>
 <body>
@@ -251,6 +325,19 @@
                 <div class="players" id="players-info">5 PLAYERS LEFT</div>
                 <button class="action-btn" id="action-btn" onclick="playerAction()">🎯 CLICK TO SURVIVE!</button>
                 <div id="action-status"></div>
+                
+                <!-- Rankings Display -->
+                <div id="rankings-section" style="margin-top: 30px;">
+                    <div id="current-round-rankings" class="hidden">
+                        <h3 style="color: #00ffff; margin-bottom: 15px;">⚡ CURRENT ROUND RANKINGS ⚡</h3>
+                        <div id="round-rankings-list"></div>
+                    </div>
+                    
+                    <div id="elimination-history" class="hidden">
+                        <h3 style="color: #ff6600; margin: 20px 0 15px 0;">💀 ELIMINATION HISTORY 💀</h3>
+                        <div id="elimination-list"></div>
+                    </div>
+                </div>
             </div>
 
             <!-- Winner Screen -->
@@ -258,6 +345,13 @@
                 <div class="winner-screen">
                     <h2 id="winner-text">🎉 YOU WON! 🎉</h2>
                     <div id="prize-info"></div>
+                    
+                    <!-- Final Rankings -->
+                    <div id="final-rankings" style="margin: 30px 0; padding: 20px; background: rgba(0,0,0,0.3); border-radius: 10px;">
+                        <h3 style="color: #ffff00; margin-bottom: 20px;">🏆 FINAL RANKINGS 🏆</h3>
+                        <div id="final-rankings-list"></div>
+                    </div>
+                    
                     <button class="action-btn" onclick="playAgain()">🎮 PLAY AGAIN</button>
                     <button class="action-btn" onclick="disconnectWallet()">🚪 DISCONNECT</button>
                 </div>
@@ -1592,10 +1686,226 @@
                     actionStatus.innerHTML = '<div class="error">💀 You have been eliminated!</div>';
                 }
             }
+            
+            // Update rankings display
+            updateRankingsDisplay(data);
+        }
+
+        // Update rankings display during game
+        function updateRankingsDisplay(gameData) {
+            const players = Object.values(gameData.players).filter(p => !p.isNpc);
+            const currentRound = gameData.round;
+            
+            // Show current round rankings if players have acted
+            const playersWhoActed = players.filter(p => 
+                p.status === 'alive' && 
+                p.lastActionRound === currentRound && 
+                p.responseTime !== null
+            );
+            
+            if (playersWhoActed.length > 0) {
+                displayCurrentRoundRankings(playersWhoActed, currentRound);
+            }
+            
+            // Show elimination history
+            displayEliminationHistory(players);
+        }
+
+        // Display current round rankings
+        function displayCurrentRoundRankings(playersWhoActed, round) {
+            const rankingsSection = document.getElementById('current-round-rankings');
+            const rankingsList = document.getElementById('round-rankings-list');
+            
+            // Sort by response time (fastest first)
+            const sortedPlayers = [...playersWhoActed].sort((a, b) => 
+                (a.responseTime || 999999) - (b.responseTime || 999999)
+            );
+            
+            let html = '';
+            sortedPlayers.forEach((player, index) => {
+                const rank = index + 1;
+                const isCurrentPlayer = player.address === gameState.wallet;
+                const responseTime = player.responseTime || 'N/A';
+                
+                let rankClass = '';
+                if (rank === 1) rankClass = 'rank-1';
+                else if (rank === 2) rankClass = 'rank-2';
+                else if (rank === 3) rankClass = 'rank-3';
+                else rankClass = 'alive';
+                
+                html += `
+                    <div class="ranking-item ${rankClass} ${isCurrentPlayer ? 'current-player' : ''}">
+                        <div class="player-info">
+                            <span class="player-rank">${getRankEmoji(rank)} #${rank}</span>
+                            <span class="player-address">${formatAddress(player.address)}</span>
+                            ${isCurrentPlayer ? '<span style="color: #ffff00;">👤 YOU</span>' : ''}
+                        </div>
+                        <div class="response-time">${responseTime}ms</div>
+                    </div>
+                `;
+            });
+            
+            rankingsList.innerHTML = html;
+            rankingsSection.classList.remove('hidden');
+        }
+
+        // Display elimination history
+        function displayEliminationHistory(players) {
+            const eliminationSection = document.getElementById('elimination-history');
+            const eliminationList = document.getElementById('elimination-list');
+            
+            const eliminatedPlayers = players.filter(p => p.status === 'eliminated');
+            
+            if (eliminatedPlayers.length === 0) {
+                eliminationSection.classList.add('hidden');
+                return;
+            }
+            
+            // Sort by elimination order (latest first)
+            const sortedEliminated = [...eliminatedPlayers].sort((a, b) => {
+                // Players eliminated in later rounds come first
+                if (a.lastActionRound !== b.lastActionRound) {
+                    return b.lastActionRound - a.lastActionRound;
+                }
+                // If same round, slower response time comes first (they were eliminated)
+                return (b.responseTime || 0) - (a.responseTime || 0);
+            });
+            
+            let html = '';
+            sortedEliminated.forEach((player, index) => {
+                const isCurrentPlayer = player.address === gameState.wallet;
+                const responseTime = player.responseTime || 'N/A';
+                const eliminationRound = player.lastActionRound || 'Unknown';
+                
+                html += `
+                    <div class="ranking-item eliminated ${isCurrentPlayer ? 'current-player' : ''}">
+                        <div class="player-info">
+                            <span class="player-rank">💀</span>
+                            <span class="player-address">${formatAddress(player.address)}</span>
+                            ${isCurrentPlayer ? '<span style="color: #ffff00;">👤 YOU</span>' : ''}
+                        </div>
+                        <div>
+                            <div class="response-time">${responseTime}ms</div>
+                            <div class="elimination-round">Round ${eliminationRound}</div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            eliminationList.innerHTML = html;
+            eliminationSection.classList.remove('hidden');
+        }
+
+        // Display final rankings when game ends
+        function displayFinalRankings(gameData) {
+            console.log('🏆 displayFinalRankings called with gameData:', gameData);
+            const finalRankingsList = document.getElementById('final-rankings-list');
+            
+            if (!finalRankingsList) {
+                console.error('❌ final-rankings-list element not found');
+                return;
+            }
+            
+            const players = Object.values(gameData.players).filter(p => !p.isNpc);
+            console.log('🏆 Players for final rankings:', players);
+            
+            // Create final ranking based on elimination order and final performance
+            const rankings = [];
+            
+            // Winner gets rank 1
+            const winner = players.find(p => p.status === 'alive');
+            if (winner) {
+                // For winners, use their best response time from any round
+                let bestTime = winner.responseTime;
+                if (!bestTime || bestTime === 'N/A') {
+                    // If no response time, they won by being the last survivor
+                    bestTime = 'Survivor';
+                }
+                
+                rankings.push({
+                    rank: 1,
+                    player: winner,
+                    status: 'winner',
+                    finalTime: bestTime
+                });
+            }
+            
+            // Eliminated players ranked by elimination round (later = better rank)
+            const eliminatedPlayers = players.filter(p => p.status === 'eliminated');
+            const eliminatedByRound = eliminatedPlayers.sort((a, b) => {
+                // Later elimination round = better rank
+                if (a.lastActionRound !== b.lastActionRound) {
+                    return b.lastActionRound - a.lastActionRound;
+                }
+                // Same round: faster response time = better rank
+                return (a.responseTime || 999999) - (b.responseTime || 999999);
+            });
+            
+            eliminatedByRound.forEach((player, index) => {
+                rankings.push({
+                    rank: index + 2, // Start from rank 2 (after winner)
+                    player: player,
+                    status: 'eliminated',
+                    finalTime: player.responseTime || 'N/A',
+                    eliminationRound: player.lastActionRound
+                });
+            });
+            
+            // Generate HTML
+            let html = '';
+            rankings.forEach((entry) => {
+                const { rank, player, status, finalTime, eliminationRound } = entry;
+                const isCurrentPlayer = player.address === gameState.wallet;
+                
+                let rankClass = '';
+                if (rank === 1) rankClass = 'rank-1';
+                else if (rank === 2) rankClass = 'rank-2';
+                else if (rank === 3) rankClass = 'rank-3';
+                else rankClass = status === 'winner' ? 'rank-1' : 'eliminated';
+                
+                html += `
+                    <div class="ranking-item ${rankClass} ${isCurrentPlayer ? 'current-player' : ''}">
+                        <div class="player-info">
+                            <span class="player-rank">${getRankEmoji(rank)} #${rank}</span>
+                            <span class="player-address">${formatAddress(player.address)}</span>
+                            ${isCurrentPlayer ? '<span style="color: #ffff00;">👤 YOU</span>' : ''}
+                        </div>
+                        <div>
+                            <div class="response-time">
+                                ${status === 'winner' ? 
+                                    (finalTime === 'Survivor' ? '🏆 Last Standing' : `🏆 ${finalTime}ms`) : 
+                                    `${finalTime}ms`}
+                            </div>
+                            ${status === 'winner' ? '<div class="elimination-round">WINNER</div>' : ''}
+                            ${eliminationRound ? `<div class="elimination-round">Eliminated Round ${eliminationRound}</div>` : ''}
+                        </div>
+                    </div>
+                `;
+            });
+            
+            finalRankingsList.innerHTML = html;
+            console.log('🏆 Final rankings HTML set:', html);
+        }
+
+        // Helper functions
+        function getRankEmoji(rank) {
+            switch(rank) {
+                case 1: return '🥇';
+                case 2: return '🥈';
+                case 3: return '🥉';
+                default: return '🏅';
+            }
+        }
+
+        function formatAddress(address) {
+            return address ? `${address.slice(0, 4)}...${address.slice(-4)}` : 'Unknown';
         }
 
         // Show Winner
         function showWinner(winner, gameData) {
+            console.log('🏆 showWinner called with:', { winner, gameData });
+            console.log('🔍 Prize data debug:', gameData?.prize);
+            console.log('🔍 Prize amount formatted:', gameData?.prize?.prizeAmountFormatted);
             showSection('winner-section');
             const winnerText = document.getElementById('winner-text');
             const prizeInfo = document.getElementById('prize-info');
@@ -1606,6 +1916,7 @@
                 // Check if prize data exists in the game data
                 if (gameData && gameData.prize) {
                     const prize = gameData.prize;
+                    console.log('🎯 SETTING PRIZE HTML with amount:', prize.prizeAmountFormatted);
                     prizeInfo.innerHTML = `
                         <div style="font-size: 1.5rem; margin: 10px 0;">
                             🏆 Prize: ${prize.prizeAmountFormatted} ${prize.tokenSymbol}
@@ -1613,8 +1924,12 @@
                         <div style="font-size: 0.9rem; color: #aaa; margin: 5px 0;">
                             (${prize.solCollected} SOL collected & swapped)
                         </div>
+                        <div style="font-size: 0.8rem; color: #888; margin: 5px 0;">
+                            Swap: ${prize.swapSignature ? prize.swapSignature.slice(0, 8) + '...' : 'N/A'}
+                        </div>
                         <div>Congratulations! You survived all rounds!</div>
                     `;
+                    console.log('🎯 Prize HTML set to:', prizeInfo.innerHTML);
                 } else {
                     // Fallback if no prize data
                     prizeInfo.innerHTML = `
@@ -1626,10 +1941,35 @@
                 }
             } else {
                 winnerText.textContent = '💀 GAME OVER 💀';
-                prizeInfo.innerHTML = `
-                    <div>Winner: ${winner ? winner.slice(0, 8) + '...' : 'No one'}</div>
-                    <div style="margin-top: 10px;">Better luck next time!</div>
-                `;
+                
+                // Show prize info even for losers
+                if (gameData && gameData.prize) {
+                    const prize = gameData.prize;
+                    console.log('🎯 SETTING LOSER PRIZE HTML with amount:', prize.prizeAmountFormatted);
+                    prizeInfo.innerHTML = `
+                        <div style="font-size: 1.2rem; margin: 10px 0;">
+                            Winner: ${winner ? winner.slice(0, 8) + '...' : 'No one'}
+                        </div>
+                        <div style="font-size: 1.1rem; color: #aaa; margin: 5px 0;">
+                            Prize: ${prize.prizeAmountFormatted} ${prize.tokenSymbol}
+                        </div>
+                        <div style="margin-top: 10px;">Better luck next time!</div>
+                    `;
+                    console.log('🎯 Loser Prize HTML set to:', prizeInfo.innerHTML);
+                } else {
+                    prizeInfo.innerHTML = `
+                        <div>Winner: ${winner ? winner.slice(0, 8) + '...' : 'No one'}</div>
+                        <div style="margin-top: 10px;">Better luck next time!</div>
+                    `;
+                }
+            }
+            
+            // Display final rankings
+            console.log('🏆 Calling displayFinalRankings with gameData:', gameData);
+            if (gameData && gameData.players) {
+                displayFinalRankings(gameData);
+            } else {
+                console.error('❌ No game data or players found for final rankings');
             }
         }
 
@@ -1669,6 +2009,10 @@
             // Reset refund button
             document.getElementById('refund-btn').textContent = '💰 LEAVE & GET REFUND';
             document.getElementById('refund-btn').disabled = false;
+            
+            // Hide rankings sections
+            document.getElementById('current-round-rankings').classList.add('hidden');
+            document.getElementById('elimination-history').classList.add('hidden');
             
             // Resume price updates
             startPriceUpdates();

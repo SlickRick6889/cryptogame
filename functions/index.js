@@ -34,13 +34,11 @@ const axios = require('axios');
 admin.initializeApp();
 const db = admin.firestore();
 
-// Game configuration
-async function getGameConfig() {
-    const configDoc = await db.collection('config').doc('game').get();
-    if (!configDoc.exists) throw new Error('Game configuration not found');
-    const configData = configDoc.data() || {};
-    
-    // Try to get private key from functions config first, then environment variable
+let treasuryWallet;
+
+// Initialize treasuryWallet once when the function instance starts
+async function initializeTreasuryWallet() {
+    console.log('Initializing treasury wallet...');
     let privateKey;
     try {
         privateKey = functions.config().treasury?.pk;
@@ -56,7 +54,6 @@ async function getGameConfig() {
         throw new Error('Treasury private key not configured. Please set up the private key securely.');
     }
 
-    let treasuryWallet;
     try {
         console.log('bs58 type:', typeof bs58);
         console.log('bs58.decode type:', typeof bs58.decode);
@@ -67,12 +64,22 @@ async function getGameConfig() {
         
         const secretKeyBytes = bs58.decode(privateKey);
         treasuryWallet = Keypair.fromSecretKey(secretKeyBytes);
-        console.log('Treasury wallet created successfully');
+        console.log('Treasury wallet created successfully during initialization');
     } catch (error) {
-        console.error('Error creating treasury wallet:', error);
+        console.error('Error creating treasury wallet during initialization:', error);
         throw new Error('Invalid treasury private key format: ' + error.message);
     }
+}
 
+// Call the initialization function immediately
+initializeTreasuryWallet();
+
+// Game configuration
+async function getGameConfig() {
+    const configDoc = await db.collection('config').doc('game').get();
+    if (!configDoc.exists) throw new Error('Game configuration not found');
+    const configData = configDoc.data() || {};
+    
     // Validate required fields
     const requiredFields = ['network', 'rpcUrl', 'prizeTokenMintAddress', 'entryFee', 'tokenSymbol'];
     for (const field of requiredFields) {
@@ -240,16 +247,8 @@ exports.joinLobby = functions.region('us-central1').runWith({
             };
         }
 
-        // Record payment in Firestore
-        const paymentData = {
-            playerAddress,
-            transactionSignature,
-            amount: config.entryFeeSol,
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-            status: 'confirmed'
-        };
-        
-        await db.collection('payments').add(paymentData);
+        // Payment will be recorded in game-specific payment summary only
+        console.log(`💰 Payment verified: ${config.entryFeeSol} SOL from ${playerAddress}`);
 
         // Find the specific lobby to join (should exist from first call)
         console.log(`🔍 Looking for existing lobbies to join with payment`);
@@ -547,7 +546,7 @@ exports.requestRefund = functions.region('us-central1').runWith({
             throw new functions.https.HttpsError('not-found', 'Game not found');
         }
 
-        const game = gameDoc.data();
+        let game = gameDoc.data();
         
         // Only allow refunds in waiting/lobby states (before game starts)
         if (!['waiting', 'lobby'].includes(game.status)) {
@@ -667,12 +666,30 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
             throw new functions.https.HttpsError('not-found', 'Game not found');
         }
 
-        const game = gameDoc.data();
-        if (game.status !== 'in_progress') {
-            throw new functions.https.HttpsError('failed-precondition', 'Game not in progress');
+        let game = gameDoc.data();
+        
+        // Allow actions if game just completed but action was submitted during valid time
+        const currentTime = admin.firestore.Timestamp.now();
+        const isRecentlyCompleted = game.status === 'completed' && 
+            game.completedAt && 
+            (currentTime.toMillis() - game.completedAt.toMillis()) < 10000; // Within 10 seconds
+        
+        if (game.status !== 'in_progress' && !isRecentlyCompleted) {
+            throw new functions.https.HttpsError('failed-precondition', `Game not in progress (status: ${game.status})`);
+        }
+        
+        // If game recently completed, don't process the action but return success
+        if (isRecentlyCompleted) {
+            console.log(`⚠️ Action submitted for recently completed game ${gameId} - ignoring gracefully`);
+            return {
+                success: true,
+                message: 'Game completed, action not processed',
+                round: game.round,
+                responseTime: clientResponseTime || 0
+            };
         }
 
-        let players = game.players || {};
+        let players = { ...game.players };
         const player = players[playerAddress];
         
         if (!player || player.status !== 'alive') {
@@ -738,8 +755,8 @@ async function processGameRounds() {
 
     let processedGames = 0;
 
-    for (const doc of activeGames.docs) {
-        const game = doc.data();
+    for (let doc of activeGames.docs) {
+        let game = doc.data();
         const gameRef = doc.ref;
         
         // Handle starting state - immediately transition to in_progress
@@ -784,10 +801,19 @@ async function processGameRounds() {
             const roundStartTime = game.roundStartedAt.toMillis();
             const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
             
-            // Add 2-second buffer for player actions to be submitted
-            if (elapsedSec >= (config.roundDurationSec + 2)) {
+            // Add 5-second buffer for player actions to be submitted (more generous)
+            if (elapsedSec >= (config.roundDurationSec + 5)) {
                 console.log(`⏰ Round ${game.round} timeout for game ${doc.id}`);
                 
+                // Re-fetch game data to ensure all player actions are captured
+                const latestGameDoc = await gameRef.get();
+                if (!latestGameDoc.exists) {
+                    console.log(`⚠️ Game ${doc.id} disappeared during round processing.`);
+                    continue; // Skip this game if it no longer exists
+                }
+                game = latestGameDoc.data(); // Use the latest game data
+                console.log(`🔄 Re-fetched game data for ${doc.id}. Player count: ${game.playerCount}`);
+
                 let players = { ...game.players };
                 
                 // Get all alive players who acted this round
@@ -817,30 +843,88 @@ async function processGameRounds() {
                     
                     // Eliminate the slowest player
                     const slowestPlayer = alivePlayersWhoActed[0];
-                    players[slowestPlayer.address] = { ...slowestPlayer, status: 'eliminated' };
+                    players[slowestPlayer.address] = { 
+                        ...slowestPlayer, 
+                        status: 'eliminated',
+                        eliminatedAt: now,
+                        eliminationReason: 'slowest_response'
+                    };
                     console.log(`🐌 Eliminated slowest player ${slowestPlayer.address} - Response time: ${slowestPlayer.responseTime}ms`);
                     console.log(`🏃 Survivors: ${alivePlayersWhoActed.slice(1).map(p => `${p.address.slice(0,4)} (${p.responseTime}ms)`).join(', ')}`);
                 } else if (alivePlayersWhoDidntAct.length > 0) {
                     // Eliminate all players who didn't act
                     alivePlayersWhoDidntAct.forEach(player => {
-                        players[player.address] = { ...player, status: 'eliminated' };
+                        players[player.address] = { 
+                            ...player, 
+                            status: 'eliminated',
+                            eliminatedAt: now,
+                            eliminationReason: 'no_action'
+                        };
                         console.log(`💀 Eliminated ${player.address} for not acting in round ${game.round}`);
                     });
                 }
                 
-                // Check for winner
+                // Check for winner - ALWAYS declare a winner
                 const alivePlayers = Object.values(players).filter(p => p.status === 'alive' && !p.isNpc);
+                const allPlayers = Object.values(players).filter(p => !p.isNpc);
+                
+                console.log(`🔍 Winner determination: ${alivePlayers.length} alive players, ${allPlayers.length} total players`);
+                console.log(`🔍 Alive players:`, alivePlayers.map(p => `${p.address.slice(0,8)} (${p.responseTime}ms)`));
+                console.log(`🔍 All players:`, allPlayers.map(p => `${p.address.slice(0,8)} - ${p.status} (${p.responseTime}ms)`));
                 
                 if (alivePlayers.length <= 1) {
-                    // Game over - trigger Jupiter swap for winner
-                    const winner = alivePlayers[0];
+                    // Game over - determine winner
+                    let winner = alivePlayers[0]; // Surviving player wins
+                    console.log(`🎯 Initial winner selection: ${winner ? winner.address.slice(0,8) : 'NONE'} (survivor)`);
+                    
+                    // If no survivors (everyone eliminated), pick winner based on best performance
+                    if (!winner && allPlayers.length > 0) {
+                        console.log(`🎯 No survivors - determining winner from eliminated players`);
+                        
+                        // Find players who acted this round (fastest response time wins)
+                        const playersWhoActed = allPlayers.filter(p => 
+                            p.lastActionRound === game.round && 
+                            p.responseTime !== null
+                        );
+                        
+                        if (playersWhoActed.length > 0) {
+                            // Winner = fastest response time among those who acted
+                            playersWhoActed.sort((a, b) => (a.responseTime || 999999) - (b.responseTime || 999999));
+                            winner = playersWhoActed[0];
+                            console.log(`🏆 Winner by fastest response: ${winner.address} (${winner.responseTime}ms)`);
+                        } else {
+                            // No one acted this round - pick winner by overall best performance
+                            // Sort by: 1) Latest elimination round, 2) Fastest response time, 3) First to join
+                            allPlayers.sort((a, b) => {
+                                // Higher round = better performance
+                                if (a.lastActionRound !== b.lastActionRound) {
+                                    return (b.lastActionRound || 0) - (a.lastActionRound || 0);
+                                }
+                                // Faster response = better performance
+                                if ((a.responseTime || 999999) !== (b.responseTime || 999999)) {
+                                    return (a.responseTime || 999999) - (b.responseTime || 999999);
+                                }
+                                // Earlier join time = better (first come, first served)
+                                return (a.joinedAt?.toMillis() || 0) - (b.joinedAt?.toMillis() || 0);
+                            });
+                            winner = allPlayers[0];
+                            console.log(`🏆 Winner by best overall performance: ${winner.address}`);
+                        }
+                        
+                        // Revive the winner
+                        players[winner.address] = { ...winner, status: 'alive' };
+                        console.log(`🔄 Revived fallback winner: ${winner.address.slice(0,8)}`);
+                    }
+                    
                     console.log(`🎉 Multiplayer game ${doc.id} complete! Winner: ${winner?.address || 'None'}`);
+                    console.log(`🎯 FINAL WINNER CONFIRMATION: ${winner?.address} (${winner?.responseTime}ms)`);
                     
                     let prizeData = null;
                     if (winner && game.totalSolCollected > 0) {
                         try {
                             // Perform Jupiter swap: SOL → BALL tokens
                             console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
+                            console.log(`💰 PRIZE RECIPIENT CONFIRMED: ${winner.address}`);
                             const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
                             
                             if (swapResult.success) {
@@ -883,14 +967,54 @@ async function processGameRounds() {
                             }
                         } catch (swapError) {
                             console.error('Jupiter swap failed:', swapError);
-                            // Fallback: estimate tokens
+                            
+                            // Check if it's a balance issue
+                            const isBalanceIssue = swapError.message.includes('Insufficient treasury balance') || 
+                                                  swapError.message.includes('insufficient funds');
+                            
+                            // Fallback: Get Jupiter quote for accurate prize estimation (even if swap failed)
+                            let estimatedAmount = game.totalSolCollected * 140; // Conservative USDC fallback
+                            let estimatedFormatted = estimatedAmount.toFixed(2);
+                            let jupiterQuoteAmount = null;
+                            
+                            try {
+                                // Get Jupiter quote for accurate estimation - this should work even if balance is low
+                                console.log(`📊 Getting Jupiter quote for prize estimation after swap failure...`);
+                                const lamports = Math.floor(game.totalSolCollected * LAMPORTS_PER_SOL);
+                                const quoteParams = new URLSearchParams({
+                                    inputMint: 'So11111111111111111111111111111111111111112',
+                                    outputMint: config.ballTokenMint,
+                                    amount: lamports.toString(),
+                                    slippageBps: '300'
+                                });
+                                
+                                const quoteUrl = `https://quote-api.jup.ag/v6/quote?${quoteParams}`;
+                                const quoteResponse = await axios.get(quoteUrl, { timeout: 5000 });
+                                
+                                if (quoteResponse.data?.outAmount) {
+                                    const tokenDecimals = await getTokenDecimals(new Connection(config.rpcUrl), config.ballTokenMint);
+                                    estimatedAmount = parseInt(quoteResponse.data.outAmount) / Math.pow(10, tokenDecimals);
+                                    estimatedFormatted = estimatedAmount.toFixed(2);
+                                    jupiterQuoteAmount = quoteResponse.data.outAmount;
+                                    console.log(`✅ Jupiter quote successful: ${estimatedFormatted} ${config.tokenSymbol} (${jupiterQuoteAmount} raw)`);
+                                } else {
+                                    console.log(`⚠️ Jupiter quote returned no data`);
+                                }
+                            } catch (quoteError) {
+                                console.log(`⚠️ Jupiter quote also failed: ${quoteError.message}`);
+                            }
+                            
                             prizeData = {
-                                prizeAmountFormatted: (game.totalSolCollected * 1000000).toLocaleString(),
+                                prizeAmountFormatted: estimatedFormatted,
                                 tokenSymbol: config.tokenSymbol,
-                                rawAmount: game.totalSolCollected * 1000000,
+                                rawAmount: jupiterQuoteAmount ? parseInt(jupiterQuoteAmount) : Math.floor(estimatedAmount * Math.pow(10, 6)),
                                 solCollected: game.totalSolCollected,
                                 swapFailed: true,
-                                error: swapError.message
+                                error: swapError.message,
+                                isBalanceIssue: isBalanceIssue,
+                                recommendedAction: isBalanceIssue ? 'Fund treasury wallet with more SOL' : 'Check Jupiter API status',
+                                jupiterQuoteAmount: jupiterQuoteAmount, // Store the quote amount we got
+                                usedJupiterQuote: !!jupiterQuoteAmount // Flag indicating we used real quote vs estimate
                             };
                         }
                     }
@@ -898,14 +1022,34 @@ async function processGameRounds() {
                     // Debug logging for prize data
                     console.log(`🏆 Setting prize data for game ${doc.id}:`, JSON.stringify(prizeData, null, 2));
                     
-                    await gameRef.update({
+                    // Create comprehensive final game data
+                    const finalGameData = {
                         status: 'completed',
                         winner: winner?.address || null,
                         players: players,
                         completedAt: now,
                         updatedAt: now,
-                        prize: prizeData
-                    });
+                        prize: prizeData,
+                        finalStats: {
+                            totalPlayers: Object.keys(players).filter(p => !players[p].isNpc).length,
+                            totalRounds: game.round,
+                            winnerResponseTime: winner?.responseTime || null,
+                            eliminationOrder: Object.values(players)
+                                .filter(p => p.status === 'eliminated' && !p.isNpc)
+                                .sort((a, b) => (b.lastActionRound || 0) - (a.lastActionRound || 0))
+                                .map(p => ({
+                                    address: p.address,
+                                    eliminationRound: p.lastActionRound,
+                                    responseTime: p.responseTime,
+                                    eliminationReason: p.eliminationReason
+                                }))
+                        }
+                    };
+                    
+                    await gameRef.update(finalGameData);
+                    
+                    // Store game-specific payment summary
+                    await storeGamePaymentSummary(doc.id, game, players);
                 } else {
                     // Next round - reset response times
                     Object.keys(players).forEach(playerId => {
@@ -937,6 +1081,35 @@ async function processGameRounds() {
     };
 }
 
+// Store game-specific payment summary
+async function storeGamePaymentSummary(gameId, gameData, players) {
+    try {
+        const paymentSummary = {
+            gameId: gameId,
+            totalPlayers: Object.keys(players).filter(p => !players[p].isNpc).length,
+            totalAmountCollected: gameData.totalSolCollected,
+            entryFeePerPlayer: gameData.entryFeeSol,
+            players: Object.values(players)
+                .filter(p => !p.isNpc)
+                .map(p => ({
+                    address: p.address,
+                    amountPaid: p.solPaid,
+                    transactionSignature: p.transactionSignature,
+                    joinedAt: p.joinedAt,
+                    finalStatus: p.status,
+                    responseTime: p.responseTime || null
+                })),
+            gameCompletedAt: admin.firestore.FieldValue.serverTimestamp(),
+            prizeDistributed: gameData.totalSolCollected > 0
+        };
+        
+        await db.collection('payments').doc(`${gameId}payments`).set(paymentSummary);
+        console.log(`💰 Payment summary stored for game ${gameId}`);
+    } catch (error) {
+        console.error(`❌ Error storing payment summary for game ${gameId}:`, error);
+    }
+}
+
 // Fast Game Tick for Real-time Processing (HTTPS Callable)
 // Fast Game Tick - Manual trigger
 exports.fastGameTick = functions.region('us-central1').https.onCall(async (data, context) => {
@@ -957,6 +1130,18 @@ async function performJupiterSwap(config, solAmount, winnerAddress) {
         
         const connection = new Connection(config.rpcUrl, 'confirmed');
         const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+        
+        // Check treasury wallet balance first
+        const treasuryBalance = await connection.getBalance(config.treasuryWallet.publicKey);
+        const treasuryBalanceSol = treasuryBalance / LAMPORTS_PER_SOL;
+        const requiredSol = solAmount + 0.003; // Reduced buffer for fees and rent
+        
+        console.log(`💰 Treasury balance: ${treasuryBalanceSol} SOL`);
+        console.log(`💰 Required for swap: ${requiredSol} SOL (${solAmount} + 0.003 buffer)`);
+        
+        if (treasuryBalance < Math.floor(requiredSol * LAMPORTS_PER_SOL)) {
+            throw new Error(`Insufficient treasury balance: need ${requiredSol} SOL, have ${treasuryBalanceSol} SOL`);
+        }
         
         // Get Jupiter quote
         const quoteParams = new URLSearchParams({
@@ -1150,6 +1335,9 @@ async function transferTokensToWinnerWithRetry(config, winnerAddress, tokenAmoun
 // Transfer tokens to winner
 async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     try {
+        console.log(`🎯 TRANSFER FUNCTION CALLED WITH WINNER: ${winnerAddress}`);
+        console.log(`🎯 Token amount to transfer: ${tokenAmount}`);
+        
         const connection = new Connection(config.rpcUrl, 'confirmed');
         const winnerPubkey = new PublicKey(winnerAddress);
         const tokenMintPubkey = new PublicKey(config.ballTokenMint);
@@ -1160,6 +1348,7 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
         
         const formattedAmount = formatTokenAmount(tokenAmount, tokenDecimals);
         console.log(`🏆 Distributing ${formattedAmount} ${config.tokenSymbol} tokens (${tokenAmount} raw) to winner: ${winnerAddress}`);
+        console.log(`🎯 FINAL CONFIRMATION - SENDING TO: ${winnerAddress}`);
         
         // Get associated token accounts with correct program
         const treasuryTokenAccount = await getAssociatedTokenAddress(
@@ -1264,15 +1453,63 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
         
         console.log(`📤 Transaction sent: ${signature}`);
         
-        // Confirm with timeout
-        const confirmation = await connection.confirmTransaction({
-            signature,
-            blockhash,
-            lastValidBlockHeight
-        }, 'confirmed');
+        // Confirm with timeout and better error handling
+        console.log(`⏳ Confirming transaction with blockhash: ${blockhash.slice(0,8)}...`);
         
-        if (confirmation.value.err) {
-            throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+        try {
+            const confirmation = await connection.confirmTransaction({
+                signature,
+                blockhash,
+                lastValidBlockHeight
+            }, 'confirmed');
+            
+            console.log(`📋 Confirmation result:`, confirmation);
+            
+            if (confirmation.value.err) {
+                throw new Error(`Transaction confirmation failed: ${JSON.stringify(confirmation.value.err)}`);
+            }
+            
+            // Double-check by fetching the transaction
+            const txInfo = await connection.getTransaction(signature, {
+                commitment: 'confirmed',
+                maxSupportedTransactionVersion: 0
+            });
+            
+            if (!txInfo) {
+                throw new Error('Transaction not found after confirmation');
+            }
+            
+            if (txInfo.meta?.err) {
+                throw new Error(`Transaction failed on-chain: ${JSON.stringify(txInfo.meta.err)}`);
+            }
+            
+            console.log(`✅ Transaction confirmed and verified on-chain`);
+            
+        } catch (confirmError) {
+            console.error('❌ Confirmation error:', confirmError);
+            
+            // Try to get transaction info to see what happened
+            try {
+                const txInfo = await connection.getTransaction(signature, {
+                    commitment: 'confirmed',
+                    maxSupportedTransactionVersion: 0
+                });
+                
+                if (txInfo) {
+                    console.log(`📋 Transaction found despite confirmation error:`, txInfo.meta);
+                    if (!txInfo.meta?.err) {
+                        console.log(`✅ Transaction actually succeeded despite confirmation error`);
+                        // Continue with success
+                    } else {
+                        throw new Error(`Transaction failed: ${JSON.stringify(txInfo.meta.err)}`);
+                    }
+                } else {
+                    throw confirmError;
+                }
+            } catch (fetchError) {
+                console.error('❌ Could not fetch transaction info:', fetchError);
+                throw confirmError;
+            }
         }
         
         console.log(`🎉 Token distribution completed! Transaction: ${signature}`);
