@@ -711,7 +711,7 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
         }
         
         // Record player action with response time
-        players[playerAddress] = {
+        const updatedPlayer = {
             ...player,
             lastActionRound: game.round,
             lastActionAt: now,
@@ -721,11 +721,66 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
             clientRoundStartTime: roundStartTime || null
         };
 
-        // Update game
-        await gameRef.update({
-            players: players,
-            updatedAt: now
-        });
+        // CRITICAL FIX: Use transaction with retry to prevent race conditions
+        let transactionSuccess = false;
+        let retryCount = 0;
+        const maxRetries = 3;
+        
+        while (!transactionSuccess && retryCount < maxRetries) {
+            try {
+                await db.runTransaction(async (transaction) => {
+                    const currentGameDoc = await transaction.get(gameRef);
+                    
+                    if (!currentGameDoc.exists) {
+                        throw new Error('Game no longer exists');
+                    }
+                    
+                    const currentGame = currentGameDoc.data();
+                    const currentPlayers = { ...currentGame.players };
+                    
+                    // Double-check player is still alive and game is still in progress
+                    const currentPlayer = currentPlayers[playerAddress];
+                    if (!currentPlayer || currentPlayer.status !== 'alive') {
+                        throw new Error('Player no longer alive');
+                    }
+                    
+                    if (currentGame.status !== 'in_progress') {
+                        throw new Error(`Game no longer in progress: ${currentGame.status}`);
+                    }
+                    
+                    // Check if action already recorded (prevent duplicates)
+                    if (currentPlayer.lastActionRound >= currentGame.round) {
+                        console.log(`⚠️ Action already recorded for player ${playerAddress} in round ${currentGame.round}`);
+                        transactionSuccess = true;
+                        return;
+                    }
+                    
+                    // Update the player data
+                    currentPlayers[playerAddress] = updatedPlayer;
+                    
+                    // Atomic update
+                    transaction.update(gameRef, {
+                        players: currentPlayers,
+                        updatedAt: now
+                    });
+                    
+                    console.log(`🔒 TRANSACTION SUCCESS: Player ${playerAddress} action recorded for round ${currentGame.round} (${responseTimeMs}ms)`);
+                });
+                
+                transactionSuccess = true;
+                
+            } catch (transactionError) {
+                retryCount++;
+                console.error(`❌ Transaction attempt ${retryCount} failed for player ${playerAddress}:`, transactionError.message);
+                
+                if (retryCount >= maxRetries) {
+                    throw new Error(`Transaction failed after ${maxRetries} attempts: ${transactionError.message}`);
+                }
+                
+                // Wait before retry (exponential backoff)
+                await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 100));
+            }
+        }
 
         return { 
             success: true, 
@@ -740,7 +795,10 @@ exports.playerAction = functions.region('us-central1').https.onCall(async (data,
     }
 });
 
-// Internal game processing function
+// Track processing locks to prevent duplicate calls
+const gameProcessingLocks = new Map();
+
+// Internal game processing function with duplicate call prevention
 async function processGameRounds() {
     const config = await getGameConfig();
     const now = admin.firestore.Timestamp.now();
@@ -756,23 +814,46 @@ async function processGameRounds() {
     let processedGames = 0;
 
     for (let doc of activeGames.docs) {
-        let game = doc.data();
-        const gameRef = doc.ref;
+        const gameId = doc.id;
         
-        // Handle starting state - immediately transition to in_progress
-        if (game.status === 'starting') {
-            console.log(`🚀 Starting game ${doc.id} with ${game.playerCount} players`);
+        // Check if this game is already being processed
+        if (gameProcessingLocks.has(gameId)) {
+            const lockTime = gameProcessingLocks.get(gameId);
+            const lockAge = Date.now() - lockTime;
             
-            await gameRef.update({
-                status: 'in_progress',
-                round: 1,
-                roundStartedAt: now,
-                updatedAt: now
-            });
-            
-            processedGames++;
-            continue;
+            // If lock is older than 30 seconds, assume it's stale and remove it
+            if (lockAge > 30000) {
+                console.log(`⚠️ Removing stale processing lock for game ${gameId} (${lockAge}ms old)`);
+                gameProcessingLocks.delete(gameId);
+            } else {
+                console.log(`⏭️ Skipping game ${gameId} - already being processed (lock age: ${lockAge}ms)`);
+                continue;
+            }
         }
+        
+        // Set processing lock
+        gameProcessingLocks.set(gameId, Date.now());
+        
+        try {
+            let game = doc.data();
+            const gameRef = doc.ref;
+            
+            console.log(`🔒 Processing game ${gameId} (status: ${game.status})`);
+        
+            // Handle starting state - immediately transition to in_progress
+            if (game.status === 'starting') {
+                console.log(`🚀 Starting game ${doc.id} with ${game.playerCount} players`);
+                
+                await gameRef.update({
+                    status: 'in_progress',
+                    round: 1,
+                    roundStartedAt: now,
+                    updatedAt: now
+                });
+                
+                processedGames++;
+                continue;
+            }
         
         // Handle lobby countdown expiration
         if (game.status === 'lobby' && game.countdownStartedAt) {
@@ -811,10 +892,50 @@ async function processGameRounds() {
                     console.log(`⚠️ Game ${doc.id} disappeared during round processing.`);
                     continue; // Skip this game if it no longer exists
                 }
-                game = latestGameDoc.data(); // Use the latest game data
-                console.log(`🔄 Re-fetched game data for ${doc.id}. Player count: ${game.playerCount}`);
+                
+                const latestGameData = latestGameDoc.data();
+                console.log(`🔄 Re-fetched game data for ${doc.id}. Player count: ${latestGameData.playerCount}`);
 
-                let players = { ...game.players };
+                // CRITICAL FIX: Merge latest player data instead of overwriting
+                // This prevents losing player actions that occurred between initial fetch and processing
+                const mergedPlayers = { ...game.players };
+                
+                // Merge in any new/updated player data from the latest fetch
+                if (latestGameData.players) {
+                    Object.keys(latestGameData.players).forEach(playerAddress => {
+                        const latestPlayer = latestGameData.players[playerAddress];
+                        const existingPlayer = mergedPlayers[playerAddress] || {};
+                        
+                        // Merge player data, keeping the most recent action data
+                        mergedPlayers[playerAddress] = {
+                            ...existingPlayer,
+                            ...latestPlayer,
+                            // Always keep the highest action round and most recent response time
+                            lastActionRound: Math.max(
+                                existingPlayer.lastActionRound || 0, 
+                                latestPlayer.lastActionRound || 0
+                            ),
+                            lastActionAt: latestPlayer.lastActionAt || existingPlayer.lastActionAt,
+                            responseTime: latestPlayer.responseTime ?? existingPlayer.responseTime,
+                            clientTimestamp: latestPlayer.clientTimestamp ?? existingPlayer.clientTimestamp,
+                            clientResponseTime: latestPlayer.clientResponseTime ?? existingPlayer.clientResponseTime
+                        };
+                    });
+                }
+                
+                // Update the game object with merged data and latest non-player fields
+                game = {
+                    ...game,
+                    ...latestGameData,
+                    players: mergedPlayers
+                };
+                
+                console.log(`🔄 Merged player data - Actions preserved for round ${game.round}`);
+                console.log(`🔍 Player action status:`, Object.keys(mergedPlayers).map(addr => 
+                    `${addr.slice(0,4)}: R${mergedPlayers[addr].lastActionRound || 0}/${game.round} (${mergedPlayers[addr].responseTime || 'N/A'}ms)`
+                ).join(', '));
+
+                let players = { ...mergedPlayers };
                 
                 // Get all alive players who acted this round
                 const alivePlayersWhoActed = Object.values(players).filter(p => 
@@ -831,6 +952,19 @@ async function processGameRounds() {
                 );
                 
                 console.log(`📊 Round ${game.round} stats: ${alivePlayersWhoActed.length} acted, ${alivePlayersWhoDidntAct.length} didn't act`);
+                
+                // DEBUGGING: Log detailed player action status
+                console.log(`🔍 DETAILED PLAYER STATUS for Round ${game.round}:`);
+                Object.values(players).filter(p => !p.isNpc).forEach(player => {
+                    console.log(`   ${player.address.slice(0,8)}: Round ${player.lastActionRound || 0}/${game.round}, ` +
+                               `Response: ${player.responseTime || 'NULL'}ms, Status: ${player.status}, ` +
+                               `ClientTime: ${player.clientResponseTime || 'NULL'}ms`);
+                });
+                
+                if (alivePlayersWhoActed.length === 0 && alivePlayersWhoDidntAct.length > 0) {
+                    console.log(`⚠️ CRITICAL: NO players acted in round ${game.round} but ${alivePlayersWhoDidntAct.length} players are alive!`);
+                    console.log(`⚠️ This indicates a race condition or action recording failure!`);
+                }
                 
                 // Eliminate players based on response time (slowest gets eliminated)
                 if (alivePlayersWhoActed.length > 1) {
@@ -922,10 +1056,10 @@ async function processGameRounds() {
                     let prizeData = null;
                     if (winner && game.totalSolCollected > 0) {
                         try {
-                            // Perform Jupiter swap: SOL → BALL tokens
-                            console.log(`🔄 Starting Jupiter swap: ${game.totalSolCollected} SOL → BALL tokens for ${winner.address}`);
+                            // Try direct swap to winner first (more reliable)
+                            console.log(`🔄 Starting DIRECT Jupiter swap: ${game.totalSolCollected} SOL → ${config.tokenSymbol} to ${winner.address}`);
                             console.log(`💰 PRIZE RECIPIENT CONFIRMED: ${winner.address}`);
-                            const swapResult = await performJupiterSwap(config, game.totalSolCollected, winner.address);
+                            const swapResult = await performDirectSwapToWinner(config, game.totalSolCollected, winner.address);
                             
                             if (swapResult.success) {
                                 // Get connection for token decimals lookup
@@ -933,9 +1067,6 @@ async function processGameRounds() {
                                 
                                 // Automatically detect token decimals from the blockchain
                                 const tokenDecimals = await getTokenDecimals(connection, config.ballTokenMint);
-                                
-                                // Transfer tokens to winner with retry logic
-                                const transferResult = await transferTokensToWinnerWithRetry(config, winner.address, parseInt(swapResult.outputAmount));
                                 
                                 // Jupiter returns the actual token amount (in smallest units)
                                 const actualTokenAmount = parseInt(swapResult.outputAmount);
@@ -945,22 +1076,46 @@ async function processGameRounds() {
                                 
                                 console.log(`💰 Prize calculation: ${actualTokenAmount} raw tokens / 10^${tokenDecimals} = ${formattedAmount} ${config.tokenSymbol}`);
                                 
-                                prizeData = {
-                                    prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
-                                    tokenSymbol: config.tokenSymbol,
-                                    rawAmount: actualTokenAmount,
-                                    solCollected: game.totalSolCollected,
-                                    swapSignature: swapResult.signature,
-                                    transferSignature: transferResult.signature || null,
-                                    swapSuccess: true,
-                                    transferSuccess: transferResult.success || false,
-                                    jupiterQuoteAmount: swapResult.outputAmount, // Store original for debugging
-                                    tokenDecimals: tokenDecimals, // Store detected decimals
-                                    tokenMint: config.ballTokenMint // Store mint for debugging
-                                };
-                                
-                                if (!transferResult.success) {
-                                    prizeData.transferError = transferResult.error;
+                                // If direct swap, no separate transfer needed
+                                if (swapResult.directTransfer) {
+                                    console.log(`✅ Direct swap successful - tokens sent directly to winner`);
+                                    prizeData = {
+                                        prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
+                                        tokenSymbol: config.tokenSymbol,
+                                        rawAmount: actualTokenAmount,
+                                        solCollected: game.totalSolCollected,
+                                        swapSignature: swapResult.signature,
+                                        transferSignature: swapResult.signature, // Same signature for direct
+                                        swapSuccess: true,
+                                        transferSuccess: true, // Direct transfer succeeded
+                                        jupiterQuoteAmount: swapResult.outputAmount,
+                                        tokenDecimals: tokenDecimals,
+                                        tokenMint: config.ballTokenMint,
+                                        directTransfer: true // Flag for direct transfer
+                                    };
+                                } else {
+                                    // Fallback: separate transfer needed
+                                    console.log(`⚠️ Fallback: performing separate transfer`);
+                                    const transferResult = await transferTokensToWinnerWithRetry(config, winner.address, actualTokenAmount);
+                                    
+                                    prizeData = {
+                                        prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
+                                        tokenSymbol: config.tokenSymbol,
+                                        rawAmount: actualTokenAmount,
+                                        solCollected: game.totalSolCollected,
+                                        swapSignature: swapResult.signature,
+                                        transferSignature: transferResult.signature || null,
+                                        swapSuccess: true,
+                                        transferSuccess: transferResult.success || false,
+                                        jupiterQuoteAmount: swapResult.outputAmount,
+                                        tokenDecimals: tokenDecimals,
+                                        tokenMint: config.ballTokenMint,
+                                        directTransfer: false
+                                    };
+                                    
+                                    if (!transferResult.success) {
+                                        prizeData.transferError = transferResult.error;
+                                    }
                                 }
                             } else {
                                 throw new Error(swapResult.error);
@@ -1072,6 +1227,13 @@ async function processGameRounds() {
                 processedGames++;
             }
         }
+        } catch (gameError) {
+            console.error(`❌ Error processing game ${gameId}:`, gameError);
+        } finally {
+            // Always remove the processing lock when done
+            gameProcessingLocks.delete(gameId);
+            console.log(`🔓 Released processing lock for game ${gameId}`);
+        }
     }
 
     return { 
@@ -1121,9 +1283,279 @@ exports.fastGameTick = functions.region('us-central1').https.onCall(async (data,
     }
 });
 
+// Add new recovery function for failed transfers
+exports.retryFailedTransfer = functions.region('us-central1').https.onCall(async (data, context) => {
+    const { gameId } = data;
+    
+    if (!gameId) {
+        throw new functions.https.HttpsError('invalid-argument', 'Game ID required');
+    }
 
+    try {
+        console.log(`🔄 Attempting to retry failed transfer for game: ${gameId}`);
+        
+        const config = await getGameConfig();
+        const gameRef = db.collection('games').doc(gameId);
+        const gameDoc = await gameRef.get();
+        
+        if (!gameDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Game not found');
+        }
 
-// Jupiter Swap Function
+        const game = gameDoc.data();
+        
+        if (game.status !== 'completed') {
+            throw new functions.https.HttpsError('failed-precondition', 'Game is not completed');
+        }
+
+        if (!game.winner) {
+            throw new functions.https.HttpsError('failed-precondition', 'No winner found');
+        }
+
+        if (!game.prize || !game.prize.swapSuccess) {
+            throw new functions.https.HttpsError('failed-precondition', 'No successful swap found to retry');
+        }
+
+        if (game.prize.transferSuccess) {
+            throw new functions.https.HttpsError('already-exists', 'Transfer already successful');
+        }
+
+        console.log(`🎯 Retrying transfer for winner: ${game.winner}`);
+        console.log(`💰 Token amount: ${game.prize.rawAmount} (${game.prize.prizeAmountFormatted} ${game.prize.tokenSymbol})`);
+
+        // Retry the transfer
+        const transferResult = await transferTokensToWinnerWithRetry(config, game.winner, game.prize.rawAmount);
+        
+        // Update the prize data with retry result
+        const updatedPrizeData = {
+            ...game.prize,
+            transferSuccess: transferResult.success,
+            transferSignature: transferResult.signature || null,
+            retryAttempted: true,
+            retryAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        
+        if (!transferResult.success) {
+            updatedPrizeData.retryError = transferResult.error;
+        } else {
+            // Clear previous error if retry succeeded
+            delete updatedPrizeData.transferError;
+        }
+
+        await gameRef.update({
+            prize: updatedPrizeData,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return {
+            success: transferResult.success,
+            message: transferResult.success ? 
+                `Transfer successful! ${game.prize.prizeAmountFormatted} ${game.prize.tokenSymbol} sent to ${game.winner}` :
+                `Transfer retry failed: ${transferResult.error}`,
+            transferSignature: transferResult.signature,
+            gameId: gameId
+        };
+
+    } catch (error) {
+        console.error('❌ Retry transfer error:', error);
+        throw new functions.https.HttpsError('internal', 'Retry failed: ' + error.message);
+    }
+});
+
+// Add function to list games needing transfer retry
+exports.listFailedTransfers = functions.region('us-central1').https.onCall(async (data, context) => {
+    try {
+        console.log('🔍 Searching for games with failed transfers...');
+        
+        const gamesQuery = db.collection('games')
+            .where('status', '==', 'completed')
+            .orderBy('completedAt', 'desc')
+            .limit(50);
+        
+        const games = await gamesQuery.get();
+        const failedTransfers = [];
+        
+        for (const doc of games.docs) {
+            const game = doc.data();
+            
+            if (game.prize && 
+                game.prize.swapSuccess && 
+                !game.prize.transferSuccess && 
+                game.winner) {
+                
+                failedTransfers.push({
+                    gameId: doc.id,
+                    winner: game.winner,
+                    prizeAmount: game.prize.prizeAmountFormatted,
+                    tokenSymbol: game.prize.tokenSymbol,
+                    completedAt: game.completedAt,
+                    swapSignature: game.prize.swapSignature,
+                    transferError: game.prize.transferError || 'Unknown error',
+                    retryAttempted: game.prize.retryAttempted || false
+                });
+            }
+        }
+        
+        console.log(`📊 Found ${failedTransfers.length} games with failed transfers`);
+        
+        return {
+            success: true,
+            failedTransfers: failedTransfers,
+            count: failedTransfers.length
+        };
+        
+    } catch (error) {
+        console.error('❌ List failed transfers error:', error);
+        throw new functions.https.HttpsError('internal', 'Failed to list transfers: ' + error.message);
+    }
+});
+
+// Improved Jupiter Swap Function - Direct to Winner
+async function performDirectSwapToWinner(config, solAmount, winnerAddress) {
+    try {
+        console.log(`🔄 Performing DIRECT Jupiter swap: ${solAmount} SOL → ${config.tokenSymbol} to ${winnerAddress}`);
+        
+        const connection = new Connection(config.rpcUrl, 'confirmed');
+        const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+        
+        // Check treasury wallet balance first
+        const treasuryBalance = await connection.getBalance(config.treasuryWallet.publicKey);
+        const treasuryBalanceSol = treasuryBalance / LAMPORTS_PER_SOL;
+        const requiredSol = solAmount + 0.003; // Buffer for fees and rent
+        
+        console.log(`💰 Treasury balance: ${treasuryBalanceSol} SOL`);
+        console.log(`💰 Required for swap: ${requiredSol} SOL (${solAmount} + 0.003 buffer)`);
+        
+        if (treasuryBalance < Math.floor(requiredSol * LAMPORTS_PER_SOL)) {
+            throw new Error(`Insufficient treasury balance: need ${requiredSol} SOL, have ${treasuryBalanceSol} SOL`);
+        }
+        
+        // Get winner's token account address
+        const winnerPubkey = new PublicKey(winnerAddress);
+        const tokenMintPubkey = new PublicKey(config.ballTokenMint);
+        
+        // Detect token program
+        const tokenProgramId = await getTokenProgramId(connection, config.ballTokenMint);
+        
+        const winnerTokenAccount = await getAssociatedTokenAddress(
+            tokenMintPubkey,
+            winnerPubkey,
+            false,
+            tokenProgramId
+        );
+        
+        console.log(`🎯 Winner token account: ${winnerTokenAccount.toString()}`);
+        
+        // Get Jupiter quote with winner as destination
+        const quoteParams = new URLSearchParams({
+            inputMint: 'So11111111111111111111111111111111111111112',
+            outputMint: config.ballTokenMint,
+            amount: lamports.toString(),
+            slippageBps: '300',
+            swapMode: 'ExactIn',
+            maxAccounts: '64'
+        });
+        
+        const quoteUrl = `https://quote-api.jup.ag/v6/quote?${quoteParams}`;
+        console.log(`📡 Getting Jupiter quote...`);
+        
+        const quoteResponse = await axios.get(quoteUrl, {
+            timeout: 10000,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        if (!quoteResponse.data) {
+            throw new Error('No quote received from Jupiter');
+        }
+        
+        const quote = quoteResponse.data;
+        console.log(`✅ Jupiter quote received:`, {
+            inputAmount: quote.inAmount,
+            outputAmount: quote.outAmount,
+            priceImpactPct: quote.priceImpactPct
+        });
+        
+        // Get swap transaction with destination override
+        console.log(`🏗️ Getting swap transaction from Jupiter (direct to winner)...`);
+        const swapResponse = await axios.post('https://quote-api.jup.ag/v6/swap', {
+            quoteResponse: quote,
+            userPublicKey: config.treasuryWallet.publicKey.toString(),
+            wrapAndUnwrapSol: true,
+            dynamicComputeUnitLimit: true,
+            dynamicSlippage: { maxBps: 500 },
+            destinationTokenAccount: winnerTokenAccount.toString(), // Direct to winner
+            prioritizationFeeLamports: {
+                priorityLevelWithMaxLamports: {
+                    maxLamports: 10000000,
+                    priorityLevel: "high"
+                }
+            }
+        }, {
+            timeout: 15000,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        if (!swapResponse.data?.swapTransaction) {
+            console.log('⚠️ Direct swap failed, falling back to treasury swap + transfer');
+            return await performJupiterSwap(config, solAmount, winnerAddress);
+        }
+        
+        // Execute direct swap
+        console.log(`✍️ Signing direct swap transaction...`);
+        const transactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
+        const transaction = VersionedTransaction.deserialize(transactionBuf);
+        transaction.sign([config.treasuryWallet]);
+        
+        console.log(`📤 Sending direct swap transaction to Solana...`);
+        const latestBlockHash = await connection.getLatestBlockhash();
+        const signature = await connection.sendRawTransaction(
+            transaction.serialize(),
+            {
+                skipPreflight: true,
+                maxRetries: 3
+            }
+        );
+        
+        // Confirm transaction
+        console.log(`⏳ Confirming transaction: ${signature}`);
+        await connection.confirmTransaction({
+            blockhash: latestBlockHash.blockhash,
+            lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+            signature: signature
+        });
+        
+        console.log(`🎉 Direct Jupiter swap completed successfully!`);
+        console.log(`📝 Transaction: https://solscan.io/tx/${signature}`);
+        
+        return {
+            success: true,
+            signature,
+            inputAmount: quote.inAmount,
+            outputAmount: quote.outAmount,
+            priceImpactPct: quote.priceImpactPct,
+            directTransfer: true // Flag to indicate this was direct
+        };
+        
+    } catch (error) {
+        console.error('❌ Direct Jupiter swap failed:', error?.message || error);
+        
+        if (error?.response?.data) {
+            console.error('🔍 Jupiter API error details:', error.response.data);
+        }
+        
+        // Fallback to original method
+        console.log('🔄 Falling back to treasury swap + transfer method...');
+        return await performJupiterSwap(config, solAmount, winnerAddress);
+    }
+}
+
+// Original Jupiter Swap Function (for fallback)
 async function performJupiterSwap(config, solAmount, winnerAddress) {
     try {
         console.log(`🔄 Performing Jupiter swap: ${solAmount} SOL → ${config.tokenSymbol}`);
@@ -1541,4 +1973,311 @@ async function transferTokensToWinner(config, winnerAddress, tokenAmount) {
     }
 }
 
-// Scheduled ticker removed - using frontend-driven processing for instant response 
+// Manual Game Recovery Function (Admin use)
+exports.fixStuckGame = functions.region('us-central1').https.onCall(async (data, context) => {
+    const { gameId } = data;
+    
+    if (!gameId) {
+        throw new functions.https.HttpsError('invalid-argument', 'Game ID required');
+    }
+
+    try {
+        console.log(`🔧 Attempting to fix stuck game: ${gameId}`);
+        
+        const config = await getGameConfig();
+        const gameRef = db.collection('games').doc(gameId);
+        const gameDoc = await gameRef.get();
+        
+        if (!gameDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Game not found');
+        }
+
+        const game = gameDoc.data();
+        
+        if (game.status !== 'in_progress') {
+            throw new functions.https.HttpsError('failed-precondition', `Game not stuck (status: ${game.status})`);
+        }
+
+        const players = Object.values(game.players).filter(p => !p.isNpc);
+        const alivePlayers = players.filter(p => p.status === 'alive');
+        
+        console.log(`🔍 Game ${gameId} analysis:`);
+        console.log(`   - Status: ${game.status}, Round: ${game.round}`);
+        console.log(`   - Alive players: ${alivePlayers.length}/${players.length}`);
+        console.log(`   - Round started: ${game.roundStartedAt ? new Date(game.roundStartedAt.toMillis()).toISOString() : 'N/A'}`);
+        
+        // Check if round has been running too long (more than 30 seconds)
+        const now = admin.firestore.Timestamp.now();
+        const roundStartTime = game.roundStartedAt ? game.roundStartedAt.toMillis() : 0;
+        const elapsedSec = (now.toMillis() - roundStartTime) / 1000;
+        
+        if (elapsedSec < 30) {
+            throw new functions.https.HttpsError('failed-precondition', `Round only running for ${elapsedSec.toFixed(1)}s - not stuck yet`);
+        }
+        
+        console.log(`⏰ Round running for ${elapsedSec.toFixed(1)} seconds - forcing processing`);
+        
+        // Force process the round
+        const result = await processSpecificGame(gameId);
+        
+        return {
+            success: true,
+            message: `Game ${gameId} processing forced`,
+            elapsedSeconds: elapsedSec.toFixed(1),
+            result: result
+        };
+        
+    } catch (error) {
+        console.error('❌ Fix stuck game error:', error);
+        throw new functions.https.HttpsError('internal', 'Failed to fix game: ' + error.message);
+    }
+});
+
+// Process a specific game by ID
+async function processSpecificGame(gameId) {
+    const config = await getGameConfig();
+    const gameRef = db.collection('games').doc(gameId);
+    const gameDoc = await gameRef.get();
+    
+    if (!gameDoc.exists) {
+        throw new Error('Game not found');
+    }
+    
+    const game = gameDoc.data();
+    const now = admin.firestore.Timestamp.now();
+    
+    console.log(`🎯 Force processing game ${gameId} (status: ${game.status}, round: ${game.round})`);
+    
+    if (game.status !== 'in_progress') {
+        return { message: 'Game not in progress', status: game.status };
+    }
+    
+    // Re-fetch to get latest player data
+    const latestGameDoc = await gameRef.get();
+    const latestGame = latestGameDoc.data();
+    const players = { ...latestGame.players };
+    
+    console.log(`🔄 Processing round ${latestGame.round} for game ${gameId}`);
+    
+    // Get all alive players who acted this round
+    const alivePlayersWhoActed = Object.values(players).filter(p => 
+        p.status === 'alive' && 
+        p.lastActionRound === latestGame.round &&
+        !p.isNpc
+    );
+    
+    // Get all alive players who didn't act
+    const alivePlayersWhoDidntAct = Object.values(players).filter(p => 
+        p.status === 'alive' && 
+        p.lastActionRound < latestGame.round &&
+        !p.isNpc
+    );
+    
+    console.log(`📊 Round ${latestGame.round} stats: ${alivePlayersWhoActed.length} acted, ${alivePlayersWhoDidntAct.length} didn't act`);
+    
+    // Log detailed player status
+    Object.values(players).filter(p => !p.isNpc).forEach(player => {
+        const acted = player.lastActionRound >= latestGame.round ? 'YES' : 'NO';
+        const responseTime = player.responseTime || 'NULL';
+        console.log(`   ${player.address.slice(0, 8)}: Round ${player.lastActionRound}/${latestGame.round}, Response: ${responseTime}ms, Status: ${player.status}, Acted: ${acted}`);
+    });
+    
+    // Process eliminations and determine winner
+    const processedGame = await processRoundEliminations(gameRef, latestGame, players, config);
+    
+    return {
+        processed: true,
+        eliminatedPlayers: processedGame.eliminatedCount || 0,
+        remainingPlayers: processedGame.remainingCount || 0,
+        winner: processedGame.winner || null,
+        gameStatus: processedGame.status
+    };
+}
+
+// Process round eliminations and determine winner
+async function processRoundEliminations(gameRef, game, players, config) {
+    const now = admin.firestore.Timestamp.now();
+    
+    // Get all alive players who acted this round
+    const alivePlayersWhoActed = Object.values(players).filter(p => 
+        p.status === 'alive' && 
+        p.lastActionRound === game.round &&
+        !p.isNpc
+    );
+    
+    // Get all alive players who didn't act
+    const alivePlayersWhoDidntAct = Object.values(players).filter(p => 
+        p.status === 'alive' && 
+        p.lastActionRound < game.round &&
+        !p.isNpc
+    );
+    
+    console.log(`🔄 Processing eliminations for round ${game.round}`);
+    console.log(`   - Players who acted: ${alivePlayersWhoActed.length}`);
+    console.log(`   - Players who didn't act: ${alivePlayersWhoDidntAct.length}`);
+    
+    let updatedPlayers = { ...players };
+    let eliminatedCount = 0;
+    
+    // First, eliminate players who didn't act
+    if (alivePlayersWhoDidntAct.length > 0) {
+        console.log(`💀 Eliminating ${alivePlayersWhoDidntAct.length} players for no action`);
+        
+        alivePlayersWhoDidntAct.forEach(player => {
+            updatedPlayers[player.address] = {
+                ...player,
+                status: 'eliminated',
+                eliminatedAt: now,
+                eliminationReason: 'no_action'
+            };
+            eliminatedCount++;
+            console.log(`   💀 ${player.address.slice(0, 8)} eliminated (no action)`);
+        });
+    }
+    
+    // Then, if multiple players acted, eliminate the slowest
+    if (alivePlayersWhoActed.length > 1) {
+        // Sort by response time (slowest first)
+        const sortedByResponseTime = [...alivePlayersWhoActed].sort((a, b) => 
+            (b.responseTime || 999999) - (a.responseTime || 999999)
+        );
+        
+        const slowestPlayer = sortedByResponseTime[0];
+        
+        updatedPlayers[slowestPlayer.address] = {
+            ...slowestPlayer,
+            status: 'eliminated',
+            eliminatedAt: now,
+            eliminationReason: 'slowest_response'
+        };
+        eliminatedCount++;
+        
+        console.log(`🐌 Eliminated slowest player ${slowestPlayer.address.slice(0, 8)} - Response time: ${slowestPlayer.responseTime}ms`);
+        
+        // Log survivors
+        const survivors = sortedByResponseTime.slice(1);
+        survivors.forEach(survivor => {
+            console.log(`🏃 Survivor: ${survivor.address.slice(0, 8)} (${survivor.responseTime}ms)`);
+        });
+    }
+    
+    // Check for winner
+    const remainingAlivePlayers = Object.values(updatedPlayers).filter(p => p.status === 'alive' && !p.isNpc);
+    
+    if (remainingAlivePlayers.length === 1) {
+        // We have a winner!
+        const winner = remainingAlivePlayers[0];
+        console.log(`🏆 Winner determined: ${winner.address}`);
+        
+        // Process prize distribution
+        let prizeData = null;
+        if (game.totalSolCollected > 0) {
+            try {
+                const swapResult = await performDirectSwapToWinner(config, game.totalSolCollected, winner.address);
+                
+                if (swapResult.success) {
+                    // Get token decimals for formatting
+                    const connection = new Connection(config.rpcUrl, 'confirmed');
+                    const tokenDecimals = await getTokenDecimals(connection, config.ballTokenMint);
+                    const actualTokenAmount = parseInt(swapResult.outputAmount);
+                    const formattedAmount = (actualTokenAmount / Math.pow(10, tokenDecimals)).toFixed(2);
+                    
+                    prizeData = {
+                        prizeAmountFormatted: parseFloat(formattedAmount).toLocaleString(),
+                        tokenSymbol: config.tokenSymbol,
+                        rawAmount: actualTokenAmount,
+                        solCollected: game.totalSolCollected,
+                        swapSignature: swapResult.signature,
+                        transferSignature: swapResult.signature,
+                        swapSuccess: true,
+                        transferSuccess: true,
+                        jupiterQuoteAmount: swapResult.outputAmount,
+                        tokenDecimals: tokenDecimals,
+                        tokenMint: config.ballTokenMint,
+                        directTransfer: true
+                    };
+                    
+                    console.log(`✅ Prize distributed: ${formattedAmount} ${config.tokenSymbol} to ${winner.address}`);
+                } else {
+                    throw new Error(swapResult.error);
+                }
+            } catch (prizeError) {
+                console.error('❌ Prize distribution failed:', prizeError);
+                prizeData = {
+                    prizeAmountFormatted: 'Error',
+                    tokenSymbol: config.tokenSymbol,
+                    solCollected: game.totalSolCollected,
+                    swapSuccess: false,
+                    transferSuccess: false,
+                    error: prizeError.message
+                };
+            }
+        }
+        
+        // Update game as completed
+        await gameRef.update({
+            status: 'completed',
+            winner: winner.address,
+            players: updatedPlayers,
+            completedAt: now,
+            updatedAt: now,
+            prize: prizeData,
+            finalStats: {
+                totalPlayers: Object.keys(players).filter(addr => !players[addr].isNpc).length,
+                totalRounds: game.round,
+                winnerResponseTime: winner.responseTime || null,
+                eliminationOrder: Object.values(updatedPlayers)
+                    .filter(p => p.status === 'eliminated' && !p.isNpc)
+                    .map(p => ({
+                        address: p.address,
+                        eliminationRound: p.lastActionRound || game.round,
+                        responseTime: p.responseTime || null,
+                        eliminationReason: p.eliminationReason || 'unknown'
+                    }))
+            }
+        });
+        
+        return {
+            status: 'completed',
+            winner: winner.address,
+            eliminatedCount,
+            remainingCount: 1,
+            prize: prizeData
+        };
+        
+    } else if (remainingAlivePlayers.length > 1) {
+        // Continue to next round
+        const nextRound = game.round + 1;
+        
+        await gameRef.update({
+            round: nextRound,
+            roundStartedAt: now,
+            players: updatedPlayers,
+            updatedAt: now
+        });
+        
+        console.log(`➡️ Advancing to round ${nextRound} with ${remainingAlivePlayers.length} players`);
+        
+        return {
+            status: 'in_progress',
+            round: nextRound,
+            eliminatedCount,
+            remainingCount: remainingAlivePlayers.length
+        };
+        
+    } else {
+        // No players left - shouldn't happen but handle gracefully
+        await gameRef.update({
+            status: 'cancelled',
+            players: updatedPlayers,
+            completedAt: now,
+            updatedAt: now
+        });
+        
+        return {
+            status: 'cancelled',
+            eliminatedCount,
+            remainingCount: 0
+        };
+    }
+}

@@ -357,7 +357,50 @@
                 </div>
             </div>
 
+            <!-- Admin Panel (Hidden by default) -->
+            <div id="admin-section" class="hidden">
+                <div style="background: rgba(128, 0, 128, 0.2); border: 2px solid #ff00ff; border-radius: 15px; padding: 20px; margin: 20px 0;">
+                    <h3 style="color: #ff00ff; margin-bottom: 20px;">🔧 ADMIN PANEL 🔧</h3>
+                    
+                    <div style="margin: 15px 0;">
+                        <button class="action-btn" onclick="listFailedTransfers()" style="background: linear-gradient(45deg, #ff6600, #ff9900);">
+                            📋 LIST FAILED TRANSFERS
+                        </button>
+                        <button class="action-btn" onclick="retrySpecificTransfer()" style="background: linear-gradient(45deg, #00aa00, #00ff00);">
+                            🔄 RETRY FAILED TRANSFER
+                        </button>
+                        <button class="action-btn" onclick="fixStuckGame()" style="background: linear-gradient(45deg, #ff0066, #ff3399);">
+                            🔧 FIX STUCK GAME
+                        </button>
+                    </div>
+                    
+                    <div id="admin-results" style="margin: 20px 0; color: #aaa; font-family: monospace; font-size: 0.9rem; max-height: 400px; overflow-y: auto;"></div>
+                    
+                    <div style="margin: 15px 0;">
+                        <label style="color: #aaa; font-size: 0.9rem;">Game ID for operations:</label>
+                        <input type="text" id="admin-game-id" placeholder="lsdgame123" style="
+                            padding: 8px; 
+                            margin: 5px 0; 
+                            background: rgba(0,0,0,0.8); 
+                            border: 1px solid #666; 
+                            color: white; 
+                            border-radius: 5px;
+                            width: 200px;
+                        ">
+                    </div>
+                    
+                    <button class="action-btn" onclick="toggleAdmin()" style="background: linear-gradient(45deg, #666, #999);">
+                        👤 HIDE ADMIN
+                    </button>
+                </div>
+            </div>
+
             <div id="error-message" class="error"></div>
+            
+            <!-- Admin Access (Hidden) -->
+            <div style="position: fixed; bottom: 10px; right: 10px; opacity: 0.1;">
+                <button onclick="toggleAdmin()" style="background: none; border: none; color: #333; font-size: 10px;">•</button>
+            </div>
         </div>
     </div>
 
@@ -2069,6 +2112,166 @@
             } catch (error) {
                 console.error('Disconnect error:', error);
                 showError('Failed to disconnect: ' + error.message);
+            }
+        }
+
+        // ===== ADMIN FUNCTIONS =====
+        
+        // Toggle admin panel visibility
+        function toggleAdmin() {
+            const adminSection = document.getElementById('admin-section');
+            const currentlyHidden = adminSection.classList.contains('hidden');
+            
+            if (currentlyHidden) {
+                adminSection.classList.remove('hidden');
+                console.log('🔧 Admin panel opened');
+            } else {
+                adminSection.classList.add('hidden');
+                console.log('🔧 Admin panel closed');
+            }
+        }
+
+        // List all games with failed transfers
+        async function listFailedTransfers() {
+            try {
+                const adminResults = document.getElementById('admin-results');
+                adminResults.innerHTML = '<div style="color: #ffff00;">🔍 Searching for failed transfers...</div>';
+                
+                console.log('🔍 Listing failed transfers...');
+                
+                const listFailedTransfersFunc = firebase.functions().httpsCallable('listFailedTransfers');
+                const result = await listFailedTransfersFunc();
+                
+                console.log('📋 Failed transfers result:', result.data);
+                
+                if (result.data.success && result.data.failedTransfers.length > 0) {
+                    let html = `<div style="color: #00ff00; margin-bottom: 15px;">📊 Found ${result.data.count} games with failed transfers:</div>`;
+                    
+                    result.data.failedTransfers.forEach((game, index) => {
+                        const completedTime = game.completedAt ? new Date(game.completedAt.toDate()).toLocaleString() : 'Unknown';
+                        const retryStatus = game.retryAttempted ? '🔄 Retry attempted' : '❌ Not retried';
+                        
+                        html += `
+                            <div style="
+                                background: rgba(255, 0, 0, 0.1); 
+                                border: 1px solid #ff4444; 
+                                border-radius: 8px; 
+                                padding: 10px; 
+                                margin: 8px 0;
+                            ">
+                                <div style="color: #ff6666; font-weight: bold;">${index + 1}. Game: ${game.gameId}</div>
+                                <div style="color: #aaa; font-size: 0.85rem;">Winner: ${game.winner.slice(0, 8)}...${game.winner.slice(-4)}</div>
+                                <div style="color: #00ffff;">Prize: ${game.prizeAmount} ${game.tokenSymbol}</div>
+                                <div style="color: #ffff00;">Completed: ${completedTime}</div>
+                                <div style="color: #ff9900;">Error: ${game.transferError}</div>
+                                <div style="color: #888; font-size: 0.8rem;">${retryStatus}</div>
+                                <div style="color: #666; font-size: 0.8rem;">Swap: ${game.swapSignature ? game.swapSignature.slice(0, 8) + '...' : 'N/A'}</div>
+                            </div>
+                        `;
+                    });
+                    
+                    adminResults.innerHTML = html;
+                } else if (result.data.success) {
+                    adminResults.innerHTML = '<div style="color: #00ff00;">✅ No failed transfers found! All prizes distributed successfully.</div>';
+                } else {
+                    adminResults.innerHTML = '<div style="color: #ff0000;">❌ Error listing transfers: ' + (result.data.message || 'Unknown error') + '</div>';
+                }
+                
+            } catch (error) {
+                console.error('❌ List failed transfers error:', error);
+                document.getElementById('admin-results').innerHTML = '<div style="color: #ff0000;">❌ Error: ' + error.message + '</div>';
+            }
+        }
+
+        // Retry a specific failed transfer
+        async function retrySpecificTransfer() {
+            try {
+                const gameId = document.getElementById('admin-game-id').value.trim();
+                
+                if (!gameId) {
+                    document.getElementById('admin-results').innerHTML = '<div style="color: #ff0000;">❌ Please enter a Game ID first</div>';
+                    return;
+                }
+                
+                const adminResults = document.getElementById('admin-results');
+                adminResults.innerHTML = `<div style="color: #ffff00;">🔄 Retrying transfer for game: ${gameId}...</div>`;
+                
+                console.log(`🔄 Retrying transfer for game: ${gameId}`);
+                
+                const retryTransferFunc = firebase.functions().httpsCallable('retryFailedTransfer');
+                const result = await retryTransferFunc({ gameId: gameId });
+                
+                console.log('✅ Retry result:', result.data);
+                
+                if (result.data.success) {
+                    adminResults.innerHTML = `
+                        <div style="color: #00ff00; font-weight: bold;">✅ ${result.data.message}</div>
+                        <div style="color: #00ffff; margin-top: 5px;">Game: ${gameId}</div>
+                        ${result.data.transferSignature ? 
+                            `<div style="color: #aaa; margin-top: 5px; font-size: 0.8rem;">
+                                Transfer: ${result.data.transferSignature.slice(0, 8)}...
+                                <a href="https://solscan.io/tx/${result.data.transferSignature}" target="_blank" style="color: #14f195;">View</a>
+                            </div>` : 
+                            ''
+                        }
+                    `;
+                    
+                    // Clear the input
+                    document.getElementById('admin-game-id').value = '';
+                } else {
+                    adminResults.innerHTML = `<div style="color: #ff0000;">❌ ${result.data.message}</div>`;
+                }
+                
+            } catch (error) {
+                console.error('❌ Retry transfer error:', error);
+                document.getElementById('admin-results').innerHTML = '<div style="color: #ff0000;">❌ Error: ' + error.message + '</div>';
+            }
+        }
+
+        // Fix a stuck game
+        async function fixStuckGame() {
+            try {
+                const gameId = document.getElementById('admin-game-id').value.trim();
+                
+                if (!gameId) {
+                    document.getElementById('admin-results').innerHTML = '<div style="color: #ff0000;">❌ Please enter a Game ID first</div>';
+                    return;
+                }
+                
+                const adminResults = document.getElementById('admin-results');
+                adminResults.innerHTML = `<div style="color: #ffff00;">🔧 Attempting to fix stuck game: ${gameId}...</div>`;
+                
+                console.log(`🔧 Fixing stuck game: ${gameId}`);
+                
+                const fixStuckGameFunc = firebase.functions().httpsCallable('fixStuckGame');
+                const result = await fixStuckGameFunc({ gameId: gameId });
+                
+                console.log('✅ Fix result:', result.data);
+                
+                if (result.data.success) {
+                    const resultData = result.data.result;
+                    adminResults.innerHTML = `
+                        <div style="color: #00ff00; font-weight: bold;">✅ ${result.data.message}</div>
+                        <div style="color: #00ffff; margin-top: 5px;">Game: ${gameId}</div>
+                        <div style="color: #aaa; margin-top: 5px;">Round was running for: ${result.data.elapsedSeconds}s</div>
+                        ${resultData.winner ? 
+                            `<div style="color: #ffff00; margin-top: 5px;">🏆 Winner: ${resultData.winner.slice(0, 8)}...</div>` : 
+                            `<div style="color: #ff9900; margin-top: 5px;">⚡ Game advanced to next round</div>`
+                        }
+                        <div style="color: #888; margin-top: 5px;">
+                            Eliminated: ${resultData.eliminatedPlayers || 0}, Remaining: ${resultData.remainingPlayers || 0}
+                        </div>
+                    `;
+                    
+                    // Clear the input
+                    document.getElementById('admin-game-id').value = '';
+                } else {
+                    adminResults.innerHTML = `<div style="color: #ff0000;">❌ ${result.data.message}</div>`;
+                }
+                
+            } catch (error) {
+                console.error('❌ Fix stuck game error:', error);
+                document.getElementById('admin-results').innerHTML = '<div style="color: #ff0000;">❌ Error: ' + error.message + '</div>';
             }
         }
 
